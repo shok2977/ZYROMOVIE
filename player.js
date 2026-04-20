@@ -5,7 +5,7 @@ const STORAGE_KEY = "flakes_movies_data";
 // whatever tag you give. If the server returns empty VAST (no <Ad>), you get no ad on ANY tag.
 // Optional test override: player.html?key=...&adtag=ENCODED_FULL_TAG_URL
 const VAST_TAG_URL_BASE =
-  "https://pubads.g.doubleclick.net/gampad/ads?sz=400x300&iu=/124319096/external/single_ad_samples&ciu_szs=300x250&impl=s&gdfp_req=1&env=vp&output=vast&unviewed_position_start=1&cust_params=deployment%3Ddevsite&correlator=";
+  "https://exalted-engineering.com/damVF-z.dfGANDvxZqG/Ua/zefm_9FueZsUbl/kIPxTxYI5mNzz_YOwyNADwUZt/NjjCkJ3BNijuAO0/OeQX";
 
 // Use same-origin API in production (Render), still works locally.
 const API_BASE =
