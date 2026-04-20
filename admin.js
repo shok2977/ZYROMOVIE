@@ -2,8 +2,12 @@ const ADMIN_ID = "Adityasharma123";
 const ADMIN_PASSWORD = "Aditya@sharma2977";
 const TMDB_API_KEY = "e84730516a1d5987f96fd63d46d2f119";
 
-const API_BASE = "http://localhost:3001";
-let cachedData = { movies: {}, lists: {}, banners: [] };
+// Use same-origin API in production (Render), still works locally.
+const API_BASE =
+  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://localhost:3001"
+    : "";
+let cachedData = { movies: {}, lists: {}, banners: [], listOrder: [] };
 const LOCAL_STORAGE_KEY = "flakes_movies_data";
 
 async function refreshData() {
@@ -14,11 +18,39 @@ async function refreshData() {
   cachedData.movies = cachedData.movies || {};
   cachedData.lists = cachedData.lists || {};
   cachedData.banners = cachedData.banners || [];
+  cachedData.listOrder = Array.isArray(cachedData.listOrder)
+    ? cachedData.listOrder
+    : [];
   return cachedData;
 }
 
 function loadMovieData() {
   return cachedData;
+}
+
+/** Same as home page: these names are auto-generated for Random rows, not real DB lists. */
+function isReservedRandomListName(name) {
+  const t = String(name || "").trim();
+  if (/^Random$/i.test(t)) return true;
+  if (/^Random\s+\d+$/i.test(t)) return true;
+  return false;
+}
+
+function getOrderedCustomListNames(data) {
+  const listsObj = data.lists || {};
+  const custom = Object.keys(listsObj).filter(
+    (n) => !isReservedRandomListName(n)
+  );
+  const apiOrder = Array.isArray(data.listOrder) ? data.listOrder : [];
+  const ordered = [];
+  apiOrder.forEach((n) => {
+    if (custom.includes(n)) ordered.push(n);
+  });
+  custom
+    .filter((n) => !ordered.includes(n))
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((n) => ordered.push(n));
+  return ordered;
 }
 
 async function upsertMovie(movie) {
@@ -56,6 +88,16 @@ async function assignMovieToList(name, key) {
     body: JSON.stringify({ name, key }),
   });
   if (!res.ok) throw new Error("Failed to assign movie to list");
+  return await res.json();
+}
+
+async function reorderListsApi(order) {
+  const res = await fetch(`${API_BASE}/api/lists/reorder`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ order }),
+  });
+  if (!res.ok) throw new Error("Failed to save list order");
   return await res.json();
 }
 
@@ -166,7 +208,9 @@ function renderDashboard() {
   const recentListEl = document.getElementById("admin-recent-list");
 
   const movieKeys = Object.keys(data.movies);
-  const listNames = Object.keys(data.lists);
+  const listNames = Object.keys(data.lists).filter(
+    (n) => !isReservedRandomListName(n)
+  );
 
   if (totalTitlesEl) totalTitlesEl.textContent = movieKeys.length;
   if (totalListsEl) totalListsEl.textContent = listNames.length;
@@ -283,6 +327,7 @@ function openEditMovie(key) {
   const titleEl = document.getElementById("edit-movie-title");
   const listEl = document.getElementById("edit-movie-languages");
   const editLangAddBtnEl = document.getElementById("edit-movie-add-language");
+  const isDownloadSource = movie.sourceKind === "download";
   // Treat as series (show per-episode Fluid code fields) if seasons exist.
   const isDownloadSeries =
     Array.isArray(movie.seasons) && movie.seasons.length;
@@ -290,37 +335,52 @@ function openEditMovie(key) {
   if (titleEl) {
     titleEl.textContent = movie.title || "Untitled";
   }
+  // Open edit section immediately so UI never looks "dead" even if deeper render fails.
+  switchSection("dashboard-section"); // ensure valid sections exist
+  switchSection("edit-movie-section");
+
   if (listEl) {
-    listEl.style.display = "";
-    if (editLangAddBtnEl) editLangAddBtnEl.style.display = "";
+    listEl.style.display = isDownloadSource ? "" : "none";
+    if (editLangAddBtnEl) editLangAddBtnEl.style.display = isDownloadSource ? "" : "none";
     listEl.innerHTML = "";
-    const langs = Array.isArray(movie.languages) ? movie.languages : [];
-    if (!langs.length) {
-      if (isDownloadSeries) {
-        // Series downloads always need at least "Original" language.
-        listEl.appendChild(
-          buildLanguageRow(
-            { name: "Original" },
-            { showScript: false, langIndex: 0, includeEpisodesPlaceholder: true }
-          )
-        );
+    if (!isDownloadSource) {
+      // No language editor for non-download sources.
+      const info = document.createElement("p");
+      info.className = "admin-help-text";
+      info.textContent = "Language/Fluid edit is available only for downloads source titles.";
+      listEl.appendChild(info);
+      listEl.style.display = "";
+      if (editLangAddBtnEl) editLangAddBtnEl.style.display = "none";
+    }
+    if (isDownloadSource) {
+      const langs = Array.isArray(movie.languages) ? movie.languages : [];
+      if (!langs.length) {
+        if (isDownloadSeries) {
+          // Series downloads always need at least "Original" language.
+          listEl.appendChild(
+            buildLanguageRow(
+              { name: "Original" },
+              { showScript: false, langIndex: 0, includeEpisodesPlaceholder: true }
+            )
+          );
+        } else {
+          const info = document.createElement("p");
+          info.className = "admin-help-text";
+          info.textContent =
+            'No extra languages yet. Click "Add language" to create one.';
+          listEl.appendChild(info);
+        }
       } else {
-        const info = document.createElement("p");
-        info.className = "admin-help-text";
-        info.textContent =
-          'No extra languages yet. Click "Add language" to create one.';
-        listEl.appendChild(info);
+        langs.forEach((lang, langIndex) => {
+          listEl.appendChild(
+            buildLanguageRow(lang, {
+              showScript: !isDownloadSeries,
+              langIndex,
+              includeEpisodesPlaceholder: isDownloadSeries,
+            })
+          );
+        });
       }
-    } else {
-      langs.forEach((lang, langIndex) => {
-        listEl.appendChild(
-          buildLanguageRow(lang, {
-            showScript: !isDownloadSeries,
-            langIndex,
-            includeEpisodesPlaceholder: isDownloadSeries,
-          })
-        );
-      });
     }
   }
 
@@ -329,14 +389,18 @@ function openEditMovie(key) {
   const episodesHelp = document.getElementById("edit-episodes-help");
   const episodesContainer = document.getElementById("edit-download-episodes");
   if (episodesTitle && episodesHelp && episodesContainer) {
-    if (isDownloadSeries) {
+    if (isDownloadSource && isDownloadSeries) {
       // For series downloads: hide the shared episodes section and render episodes under each language row.
       episodesTitle.style.display = "none";
       episodesHelp.style.display = "none";
       episodesContainer.style.display = "none";
       episodesContainer.innerHTML = "";
 
-      rebuildDownloadEpisodesInputs(movie);
+      try {
+        rebuildDownloadEpisodesInputs(movie);
+      } catch (err) {
+        console.error("Failed to render episode editors:", err);
+      }
     } else {
       episodesTitle.style.display = "none";
       episodesHelp.style.display = "none";
@@ -344,9 +408,6 @@ function openEditMovie(key) {
       episodesContainer.style.display = "none";
     }
   }
-
-  switchSection("dashboard-section"); // ensure valid sections exist
-  switchSection("edit-movie-section");
 }
 
 function renderLists() {
@@ -358,24 +419,54 @@ function renderLists() {
   listsTable.innerHTML = "";
   assignListSelect.innerHTML = "";
 
-  const listNames = Object.keys(data.lists || {});
+  const note = document.createElement("p");
+  note.className = "admin-help-text";
+  note.style.marginBottom = "12px";
+  note.textContent =
+    'Home page par "Random" / "Random 2" … hamesha sabse niche dikhti hain — saari titles wahan (10 per row, shuffle). Neeche se number set karein: 1 = sabse upar wali list (Random ke upar).';
+  listsTable.appendChild(note);
+
+  const listNames = getOrderedCustomListNames(data);
   if (listNames.length === 0) {
-    listsTable.innerHTML = '<p class="admin-empty">No lists yet. Create some above.</p>';
+    const empty = document.createElement("p");
+    empty.className = "admin-empty";
+    empty.textContent = "No custom lists yet. Create some above.";
+    listsTable.appendChild(empty);
     return;
   }
 
   const table = document.createElement("div");
-  table.className = "admin-table-inner";
+  table.className = "admin-table-inner admin-lists-order-table";
   const header = document.createElement("div");
   header.className = "admin-table-row admin-table-header";
-  header.innerHTML = `<div>List name</div><div>Titles</div>`;
+  header.innerHTML = `<div>Position #</div><div>List name</div><div>Titles</div>`;
   table.appendChild(header);
 
-  listNames.forEach((name) => {
+  listNames.forEach((name, idx) => {
     const count = (data.lists[name] || []).length;
     const row = document.createElement("div");
     row.className = "admin-table-row";
-    row.innerHTML = `<div>${name}</div><div>${count}</div>`;
+
+    const posCell = document.createElement("div");
+    const posInput = document.createElement("input");
+    posInput.type = "number";
+    posInput.min = "1";
+    posInput.max = "999";
+    posInput.className = "admin-input admin-list-order-input";
+    posInput.dataset.listName = name;
+    posInput.value = String(idx + 1);
+    posInput.title = "Home page order (1 = top, under banner)";
+    posCell.appendChild(posInput);
+
+    const nameCell = document.createElement("div");
+    nameCell.textContent = name;
+
+    const countCell = document.createElement("div");
+    countCell.textContent = String(count);
+
+    row.appendChild(posCell);
+    row.appendChild(nameCell);
+    row.appendChild(countCell);
     table.appendChild(row);
 
     const opt = document.createElement("option");
@@ -384,6 +475,36 @@ function renderLists() {
     assignListSelect.appendChild(opt);
   });
   listsTable.appendChild(table);
+
+  const saveOrderBtn = document.createElement("button");
+  saveOrderBtn.type = "button";
+  saveOrderBtn.className = "admin-primary-btn";
+  saveOrderBtn.style.marginTop = "14px";
+  saveOrderBtn.textContent = "Save list positions (1, 2, 3…)";
+  saveOrderBtn.addEventListener("click", async () => {
+    const inputs = listsTable.querySelectorAll(".admin-list-order-input");
+    const pairs = [];
+    inputs.forEach((inp) => {
+      const n = inp.dataset.listName;
+      let pos = parseInt(inp.value, 10);
+      if (!Number.isFinite(pos) || pos < 1) pos = 999;
+      pairs.push({ name: n, pos });
+    });
+    pairs.sort(
+      (a, b) => a.pos - b.pos || String(a.name).localeCompare(String(b.name))
+    );
+    const order = pairs.map((p) => p.name);
+    try {
+      await reorderListsApi(order);
+      await refreshData();
+      renderLists();
+      alert("List order save ho gaya.");
+    } catch (e) {
+      console.error(e);
+      alert("Order save nahi ho saka. Server chal raha hai?");
+    }
+  });
+  listsTable.appendChild(saveOrderBtn);
 }
 
 function renderBanners() {
@@ -500,6 +621,19 @@ async function fetchTmdbTvSeasons(tmdbId) {
   return seasons;
 }
 
+async function detectTmdbType(tmdbId) {
+  const base = "https://api.themoviedb.org/3";
+  const movieRes = await fetch(
+    `${base}/movie/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`
+  );
+  if (movieRes.ok) return "movie";
+  const tvRes = await fetch(
+    `${base}/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`
+  );
+  if (tvRes.ok) return "tv";
+  throw new Error("TMDB ID not found as movie or TV show.");
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const loginCard = document.getElementById("admin-login-card");
   const panel = document.getElementById("admin-panel");
@@ -574,6 +708,12 @@ document.addEventListener("DOMContentLoaded", async () => {
       const input = document.getElementById("new-list-name");
       const name = input?.value?.trim();
       if (!name) return;
+      if (isReservedRandomListName(name)) {
+        alert(
+          'Yeh naam reserved hai. "Random" lists home page par automatic banti hain — koi aur naam use karein.'
+        );
+        return;
+      }
       await upsertList(name);
       if (input) input.value = "";
       await refreshData();
@@ -733,6 +873,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           openEditMovie(key);
         } catch (err) {
           console.error("Failed to open edit panel for key:", key, err);
+          alert("Edit panel open nahi ho saka. Console error check karein.");
         }
       }
     });
@@ -745,25 +886,56 @@ document.addEventListener("DOMContentLoaded", async () => {
       addTitleSuccess.textContent = "";
 
       const tmdbId = (document.getElementById("tmdb-id")?.value || "").trim();
-      const type = document.getElementById("content-type")?.value || "movie";
+      const selectedType =
+        document.getElementById("content-type")?.value || "movie";
       const listName = document.getElementById("assign-list")?.value || "";
       const sourceKind =
         document.getElementById("source-kind")?.value || "vidsrc";
       const downloadScript =
         document.getElementById("download-fluid-script")?.value || "";
+      const epContainer = document.getElementById("download-episodes-container");
 
       if (!tmdbId || !listName) {
         addTitleError.textContent = "TMDB ID and list are required.";
         return;
       }
-      if (
-        sourceKind === "download" &&
-        (type === "movie" || type === "animeMovie") &&
-        !downloadScript.trim()
-      ) {
-        addTitleError.textContent =
-          "For downloads, Fluid Player code is required for movies.";
-        return;
+      let type = selectedType;
+      let detectedDownloadSeasons = [];
+      if (sourceKind === "download") {
+        try {
+          if (
+            currentDownloadEpisodesTmdb === tmdbId &&
+            Array.isArray(currentDownloadEpisodesSeasons)
+          ) {
+            detectedDownloadSeasons = currentDownloadEpisodesSeasons;
+          } else {
+            detectedDownloadSeasons = await fetchTmdbTvSeasons(tmdbId);
+            currentDownloadEpisodesTmdb = tmdbId;
+            currentDownloadEpisodesSeasons = detectedDownloadSeasons;
+          }
+          const hasSeriesByTmdb =
+            Array.isArray(detectedDownloadSeasons) &&
+            detectedDownloadSeasons.length > 0;
+          const hasSeriesRows =
+            !!epContainer &&
+            epContainer.querySelectorAll(".admin-episode-row").length > 0;
+          const isSeries = hasSeriesByTmdb || hasSeriesRows;
+
+          if (isSeries) {
+            type =
+              selectedType === "anime" || selectedType === "animeMovie"
+                ? "anime"
+                : "tv";
+          } else {
+            type =
+              selectedType === "anime" || selectedType === "animeMovie"
+                ? "animeMovie"
+                : "movie";
+          }
+        } catch (err) {
+          addTitleError.textContent = err?.message || "TMDB type detect failed.";
+          return;
+        }
       }
 
       let meta;
@@ -771,7 +943,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       try {
         meta = await fetchTmdbDetails(tmdbId, type);
         if (type === "tv" || type === "anime") {
-          seasons = await fetchTmdbTvSeasons(tmdbId);
+          seasons =
+            Array.isArray(detectedDownloadSeasons) &&
+            detectedDownloadSeasons.length
+              ? detectedDownloadSeasons
+              : await fetchTmdbTvSeasons(tmdbId);
         }
       } catch (err) {
         console.error(err);
@@ -796,9 +972,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (sourceKind === "download") {
         if (type === "tv" || type === "anime") {
           // Per-episode codes from UI
-          const epContainer = document.getElementById(
-            "download-episodes-container"
-          );
           const epMap = {};
           if (epContainer) {
             const rows = Array.from(
@@ -820,6 +993,11 @@ document.addEventListener("DOMContentLoaded", async () => {
           // Backward compatibility
           movieRecord.downloadEpisodes = epMap;
         } else {
+          if (!downloadScript.trim()) {
+            addTitleError.textContent =
+              "For downloads movies, Fluid Player code is required.";
+            return;
+          }
           // Movie / Anime movie: single Fluid code via languages
           movieRecord.languages = [
             {
@@ -932,6 +1110,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const data = loadMovieData();
       const movie = data.movies[currentEditMovieKey];
       if (!movie) return;
+      if (movie.sourceKind !== "download") return;
 
       const isDownloadSeries =
         Array.isArray(movie.seasons) &&
@@ -968,6 +1147,15 @@ document.addEventListener("DOMContentLoaded", async () => {
       const data = loadMovieData();
       const movie = data.movies[currentEditMovieKey];
       if (!movie) return;
+      if (movie.sourceKind !== "download") {
+        await upsertMovie(movie);
+        await refreshData();
+        renderDashboard();
+        renderLists();
+        currentEditMovieKey = null;
+        switchSection("dashboard-section");
+        return;
+      }
 
       const isDownloadSeries =
         Array.isArray(movie.seasons) && movie.seasons.length;
@@ -1041,6 +1229,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (!currentEditMovieKey) return;
         const data = loadMovieData();
         const movie = data.movies[currentEditMovieKey];
+        if (!movie || movie.sourceKind !== "download") return;
 
         const row = target.closest(".admin-language-row");
         if (row) row.remove();
@@ -1062,19 +1251,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (sourceKindSelect && downloadFields) {
     const updateDownloadVisibility = () => {
       const sourceVal = sourceKindSelect.value;
-      const typeVal = contentTypeSelect?.value || "movie";
       // Show/hide overall download block based on source
       downloadFields.style.display = sourceVal === "download" ? "block" : "none";
 
       if (downloadMovieOnlyFields) {
-        // If type is TV/Anime, permanently remove the big box so it can never show for series.
-        if (typeVal === "tv" || typeVal === "anime") {
-          downloadMovieOnlyFields.remove();
-        } else {
-          // Movie / anime movie: show big box only when downloads is selected
-          downloadMovieOnlyFields.style.display =
-            sourceVal === "download" ? "block" : "none";
-        }
+        const hasSeriesData =
+          Array.isArray(currentDownloadEpisodesSeasons) &&
+          currentDownloadEpisodesSeasons.length > 0;
+        const shouldShowMovieCode =
+          sourceVal === "download" &&
+          !hasSeriesData;
+        downloadMovieOnlyFields.style.display = shouldShowMovieCode ? "block" : "none";
       }
     };
     sourceKindSelect.addEventListener("change", () => {
@@ -1099,6 +1286,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       !epContainer
     ) {
       if (epContainer) epContainer.innerHTML = "";
+      if (sourceVal !== "download" || !tmdbVal) {
+        currentDownloadEpisodesTmdb = null;
+        currentDownloadEpisodesSeasons = null;
+      }
+      if (downloadMovieOnlyFields) {
+        downloadMovieOnlyFields.style.display =
+          sourceVal === "download" && tmdbVal ? "block" : "none";
+      }
       return;
     }
 
@@ -1120,9 +1315,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       if (Array.isArray(seasons) && seasons.length > 0) {
         // This TMDB id clearly has seasons/episodes => treat as series.
-        // Remove big movie-only Fluid field so only per-episode fields remain.
+        // Hide movie-only field and show per-episode fields.
         if (downloadMovieOnlyFields) {
-          downloadMovieOnlyFields.remove();
+          downloadMovieOnlyFields.style.display = "none";
         }
         seasons.forEach((s) => {
           const seasonHeader = document.createElement("h4");
@@ -1151,12 +1346,35 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
     } catch (_) {
-      // ignore UI errors
+      // If TMDB season lookup fails (network/rate-limit), keep at least movie-code input visible.
+      if (epContainer) epContainer.innerHTML = "";
+      currentDownloadEpisodesTmdb = tmdbVal;
+      currentDownloadEpisodesSeasons = [];
+      if (downloadMovieOnlyFields && sourceVal === "download") {
+        downloadMovieOnlyFields.style.display = "block";
+      }
     }
   }
 
+  let tmdbLookupTimer = null;
+  const scheduleDownloadEpisodesLookup = () => {
+    if (tmdbLookupTimer) clearTimeout(tmdbLookupTimer);
+    tmdbLookupTimer = setTimeout(() => {
+      currentDownloadEpisodesTmdb = null;
+      currentDownloadEpisodesSeasons = null;
+      maybeLoadDownloadEpisodes();
+    }, 350);
+  };
+
   if (sourceKindSelect) {
     sourceKindSelect.addEventListener("change", () => {
+      if (sourceKindSelect.value === "download") {
+        scheduleDownloadEpisodesLookup();
+      } else {
+        if (tmdbLookupTimer) clearTimeout(tmdbLookupTimer);
+        currentDownloadEpisodesTmdb = null;
+        currentDownloadEpisodesSeasons = null;
+      }
       maybeLoadDownloadEpisodes();
     });
   }
@@ -1168,6 +1386,25 @@ document.addEventListener("DOMContentLoaded", async () => {
     });
   }
   if (tmdbInput) {
+    tmdbInput.addEventListener("input", () => {
+      if (!sourceKindSelect || sourceKindSelect.value !== "download") return;
+      const val = tmdbInput.value?.trim() || "";
+      if (!val) {
+        currentDownloadEpisodesTmdb = null;
+        currentDownloadEpisodesSeasons = null;
+        maybeLoadDownloadEpisodes();
+        return;
+      }
+      scheduleDownloadEpisodesLookup();
+    });
+    tmdbInput.addEventListener("paste", () => {
+      if (!sourceKindSelect || sourceKindSelect.value !== "download") return;
+      scheduleDownloadEpisodesLookup();
+    });
+    tmdbInput.addEventListener("change", () => {
+      if (!sourceKindSelect || sourceKindSelect.value !== "download") return;
+      scheduleDownloadEpisodesLookup();
+    });
     tmdbInput.addEventListener("blur", () => {
       currentDownloadEpisodesTmdb = null;
       currentDownloadEpisodesSeasons = null;

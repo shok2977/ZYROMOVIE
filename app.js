@@ -1,6 +1,10 @@
 // UTILITIES FOR MOVIE STORAGE
 
-const API_BASE = "http://localhost:3001";
+// Use same-origin API in production (Render), still works locally.
+const API_BASE =
+  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://localhost:3001"
+    : "";
 
 async function fetchAllData() {
   const res = await fetch(`${API_BASE}/api/data`);
@@ -20,6 +24,7 @@ function loadMovieDataLocal() {
       movies: parsed.movies || {},
       lists: parsed.lists || {},
       banners: parsed.banners || [],
+      listOrder: Array.isArray(parsed.listOrder) ? parsed.listOrder : [],
     };
   } catch (_) {
     return { movies: {}, lists: {}, banners: [] };
@@ -47,7 +52,151 @@ function getMovieIdKey(tmdbId, type) {
   return `${type}-${tmdbId}`;
 }
 
+/** Home page only: "Random" / "Random 2" … are built-in (not stored in DB). */
+function isReservedRandomListName(name) {
+  const t = String(name || "").trim();
+  if (/^Random$/i.test(t)) return true;
+  if (/^Random\s+\d+$/i.test(t)) return true;
+  return false;
+}
+
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) {
+    out.push(arr.slice(i, i + size));
+  }
+  return out;
+}
+
+const RANDOM_ROW_SIZE = 10;
+
+function navigateToMoviePlayer(movie, movieKey) {
+  if (
+    movie.sourceKind === "download" &&
+    (movie.type === "tv" || movie.type === "anime") &&
+    Array.isArray(movie.seasons) &&
+    movie.seasons.length
+  ) {
+    const firstSeason = movie.seasons[0];
+    const firstEp =
+      (firstSeason.episodes &&
+        firstSeason.episodes[0] &&
+        firstSeason.episodes[0].episode_number) ||
+      1;
+    const url = new URL("player-lang.html", window.location.href);
+    url.searchParams.set("key", movieKey);
+    url.searchParams.set("season", String(firstSeason.season_number));
+    url.searchParams.set("episode", String(firstEp));
+    url.searchParams.set("lang", "0");
+    window.location.href = url.toString();
+  } else {
+    window.location.href = `player.html?key=${encodeURIComponent(movieKey)}`;
+  }
+}
+
+function appendMovieListSection(root, data, listTitle, movieKeys) {
+  if (!movieKeys.length) return;
+
+  const container = document.createElement("div");
+  container.className = "movie-list-container";
+
+  const titleEl = document.createElement("h1");
+  titleEl.className = "movie-list-title";
+  titleEl.textContent = listTitle;
+  container.appendChild(titleEl);
+
+  const wrapper = document.createElement("div");
+  wrapper.className = "movie-list-wrapper";
+
+  const leftBtn = document.createElement("button");
+  leftBtn.type = "button";
+  leftBtn.className = "movie-list-nav movie-list-nav-left";
+  leftBtn.setAttribute("aria-label", "Scroll left");
+  leftBtn.innerHTML = "‹";
+
+  const rightBtn = document.createElement("button");
+  rightBtn.type = "button";
+  rightBtn.className = "movie-list-nav movie-list-nav-right";
+  rightBtn.setAttribute("aria-label", "Scroll right");
+  rightBtn.innerHTML = "›";
+
+  const listEl = document.createElement("div");
+  listEl.className = "movie-list";
+
+  movieKeys.forEach((movieKey) => {
+    const movie = data.movies[movieKey];
+    if (!movie) return;
+
+    const item = document.createElement("div");
+    item.className = "movie-list-item";
+    item.dataset.movieKey = movieKey;
+    item.addEventListener("click", () => navigateToMoviePlayer(movie, movieKey));
+    const img = document.createElement("img");
+    img.className = "movie-list-item-img";
+    img.src = movie.posterUrl || "img/1.jpeg";
+    img.alt = movie.title || "";
+
+    const title = document.createElement("span");
+    title.className = "movie-list-item-title";
+    title.textContent = movie.title || "Untitled";
+
+    const desc = document.createElement("p");
+    desc.className = "movie-list-item-desc";
+    desc.textContent =
+      movie.overview || "No description available for this title yet.";
+
+    const btn = document.createElement("button");
+    btn.className = "movie-list-item-button";
+    btn.textContent = "Watch";
+
+    item.appendChild(img);
+    item.appendChild(title);
+    item.appendChild(desc);
+    item.appendChild(btn);
+    listEl.appendChild(item);
+  });
+
+  leftBtn.addEventListener("click", () => {
+    wrapper.scrollBy({ left: -900, behavior: "smooth" });
+  });
+  rightBtn.addEventListener("click", () => {
+    wrapper.scrollBy({ left: 900, behavior: "smooth" });
+  });
+
+  wrapper.appendChild(listEl);
+  container.appendChild(wrapper);
+  container.appendChild(leftBtn);
+  container.appendChild(rightBtn);
+  root.appendChild(container);
+}
+
 // RENDER LISTS ON HOME PAGE (DYNAMIC)
+
+function getOrderedCustomListNames(data) {
+  const listsObj = data.lists || {};
+  const custom = Object.keys(listsObj).filter(
+    (n) => !isReservedRandomListName(n)
+  );
+  const apiOrder = Array.isArray(data.listOrder) ? data.listOrder : [];
+  const ordered = [];
+  apiOrder.forEach((n) => {
+    if (custom.includes(n)) ordered.push(n);
+  });
+  custom
+    .filter((n) => !ordered.includes(n))
+    .sort((a, b) => a.localeCompare(b))
+    .forEach((n) => ordered.push(n));
+  return ordered;
+}
 
 async function renderDynamicLists() {
   const data = await fetchAllDataPreferApi();
@@ -56,95 +205,26 @@ async function renderDynamicLists() {
 
   root.innerHTML = "";
 
-  const listNames = Object.keys(data.lists);
-  if (listNames.length === 0) {
-    return;
-  }
+  const movies = data.movies || {};
+  const allKeys = Object.keys(movies);
+
+  const listNames = getOrderedCustomListNames(data);
 
   listNames.forEach((listName) => {
-    const movieIds = data.lists[listName] || [];
-    if (movieIds.length === 0) return;
-
-    const container = document.createElement("div");
-    container.className = "movie-list-container";
-
-    const titleEl = document.createElement("h1");
-    titleEl.className = "movie-list-title";
-    titleEl.textContent = listName;
-    container.appendChild(titleEl);
-
-    const wrapper = document.createElement("div");
-    wrapper.className = "movie-list-wrapper";
-
-    const listEl = document.createElement("div");
-    listEl.className = "movie-list";
-
-    movieIds.forEach((movieKey) => {
-      const movie = data.movies[movieKey];
-      if (!movie) return;
-
-      const item = document.createElement("div");
-      item.className = "movie-list-item";
-      item.dataset.movieKey = movieKey;
-      item.addEventListener("click", () => {
-        // If this is a download TV/Anime, go straight to Fluid per-episode player (Season 1 Episode 1).
-        if (
-          movie.sourceKind === "download" &&
-          (movie.type === "tv" || movie.type === "anime") &&
-          Array.isArray(movie.seasons) &&
-          movie.seasons.length
-        ) {
-          const firstSeason = movie.seasons[0];
-          const firstEp =
-            (firstSeason.episodes &&
-              firstSeason.episodes[0] &&
-              firstSeason.episodes[0].episode_number) ||
-            1;
-          const url = new URL("player-lang.html", window.location.href);
-          url.searchParams.set("key", movieKey);
-          url.searchParams.set("season", String(firstSeason.season_number));
-          url.searchParams.set("episode", String(firstEp));
-          url.searchParams.set("lang", "0");
-          window.location.href = url.toString();
-        } else {
-          window.location.href = `player.html?key=${encodeURIComponent(
-            movieKey
-          )}`;
-        }
-      });
-
-      const img = document.createElement("img");
-      img.className = "movie-list-item-img";
-      img.src = movie.posterUrl || "img/1.jpeg";
-      img.alt = movie.title || "";
-
-      const title = document.createElement("span");
-      title.className = "movie-list-item-title";
-      title.textContent = movie.title || "Untitled";
-
-      const desc = document.createElement("p");
-      desc.className = "movie-list-item-desc";
-      desc.textContent =
-        movie.overview ||
-        "No description available for this title yet.";
-
-      const btn = document.createElement("button");
-      btn.className = "movie-list-item-button";
-      btn.textContent = "Watch";
-
-      // Button click also navigates, but main click is on whole card
-
-      item.appendChild(img);
-      item.appendChild(title);
-      item.appendChild(desc);
-      item.appendChild(btn);
-      listEl.appendChild(item);
-    });
-
-    wrapper.appendChild(listEl);
-    container.appendChild(wrapper);
-    root.appendChild(container);
+    let movieIds = (data.lists[listName] || []).filter((k) => movies[k]);
+    movieIds = shuffleArray(movieIds);
+    appendMovieListSection(root, data, listName, movieIds);
   });
+
+  // Random rows always at bottom: every title; 10 per row; shuffled each load.
+  if (allKeys.length) {
+    const shuffledAll = shuffleArray(allKeys);
+    const parts = chunkArray(shuffledAll, RANDOM_ROW_SIZE);
+    parts.forEach((chunkKeys, i) => {
+      const title = i === 0 ? "Random" : `Random ${i + 1}`;
+      appendMovieListSection(root, data, title, chunkKeys);
+    });
+  }
 }
 
 // SEARCH
@@ -179,31 +259,9 @@ async function performSearch(query) {
     const item = document.createElement("div");
     item.className = "movie-list-item";
     item.dataset.movieKey = movieKey;
-    item.addEventListener("click", () => {
-      if (
-        movie.sourceKind === "download" &&
-        (movie.type === "tv" || movie.type === "anime") &&
-        Array.isArray(movie.seasons) &&
-        movie.seasons.length
-      ) {
-        const firstSeason = movie.seasons[0];
-        const firstEp =
-          (firstSeason.episodes &&
-            firstSeason.episodes[0] &&
-            firstSeason.episodes[0].episode_number) ||
-          1;
-        const url = new URL("player-lang.html", window.location.href);
-        url.searchParams.set("key", movieKey);
-        url.searchParams.set("season", String(firstSeason.season_number));
-        url.searchParams.set("episode", String(firstEp));
-        url.searchParams.set("lang", "0");
-        window.location.href = url.toString();
-      } else {
-        window.location.href = `player.html?key=${encodeURIComponent(
-          movieKey
-        )}`;
-      }
-    });
+    item.addEventListener("click", () =>
+      navigateToMoviePlayer(movie, movieKey)
+    );
 
     const img = document.createElement("img");
     img.className = "movie-list-item-img";
@@ -407,30 +465,5 @@ async function goToBannerTarget(banner) {
 }
 
 function redirectToMoviePlayer(movie, movieKey) {
-  // For downloads TV/Anime, redirect straight to player-lang with S1E1.
-  if (
-    movie.sourceKind === "download" &&
-    (movie.type === "tv" || movie.type === "anime") &&
-    Array.isArray(movie.seasons) &&
-    movie.seasons.length
-  ) {
-    const firstSeason = movie.seasons[0];
-    const firstEp =
-      (firstSeason.episodes &&
-        firstSeason.episodes &&
-        firstSeason.episodes[0] &&
-        firstSeason.episodes[0].episode_number) ||
-      1;
-    const url = new URL("player-lang.html", window.location.href);
-    url.searchParams.set("key", movieKey);
-    url.searchParams.set("season", String(firstSeason.season_number));
-    url.searchParams.set("episode", String(firstEp));
-    url.searchParams.set("lang", "0");
-    window.location.href = url.toString();
-    return;
-  }
-
-  window.location.href = `player.html?key=${encodeURIComponent(
-    movieKey
-  )}`;
+  navigateToMoviePlayer(movie, movieKey);
 }

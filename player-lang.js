@@ -1,6 +1,10 @@
 const STORAGE_KEY = "flakes_movies_data";
 
-const API_BASE = "http://localhost:3001";
+// Use same-origin API in production (Render), still works locally.
+const API_BASE =
+  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://localhost:3001"
+    : "";
 
 async function fetchAllData() {
   const res = await fetch(`${API_BASE}/api/data`);
