@@ -28,10 +28,43 @@ function getEffectiveVastTagBase() {
 function buildVastTagUrl() {
   const base = getEffectiveVastTagBase();
   if (!base) return "";
-  const correlator = `${Date.now()}${Math.floor(Math.random() * 1e9)}`;
-  if (base.includes("correlator=")) return base + correlator;
-  const sep = base.includes("?") ? "&" : "?";
-  return `${base}${sep}correlator=${encodeURIComponent(correlator)}`;
+  // NOTE: Adding a random correlator disables caching and can make VAST slower
+  // (extra redirects + no CDN warmup). Many networks don't need it.
+  // If you ever need forced no-cache, pass player.html?...&adtag=<url-with-your-own-cachebust>.
+  return base;
+}
+
+// Keep one VAST URL per page-load so we can prefetch it early.
+let _sessionVastTagUrl = null;
+function getSessionVastTagUrl() {
+  if (_sessionVastTagUrl) return _sessionVastTagUrl;
+  _sessionVastTagUrl = buildVastTagUrl();
+  return _sessionVastTagUrl;
+}
+
+let _preloadedVast = null;
+function preloadAds() {
+  try {
+    const vastBaseForCheck = getEffectiveVastTagBase();
+    const hasVast = !!(vastBaseForCheck && String(vastBaseForCheck).trim());
+    if (!hasVast) return;
+
+    const vastTagUrl = getSessionVastTagUrl();
+    if (!vastTagUrl) return;
+
+    // Fire and forget: warm up redirects + CDN + our proxy route.
+    const proxyUrl =
+      `${API_BASE}/api/vast/proxy?tag=` + encodeURIComponent(vastTagUrl);
+    const mediaUrl =
+      `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl);
+
+    _preloadedVast = {
+      vastTagUrl,
+      proxyUrl,
+      mediaPromise: fetch(mediaUrl).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      proxyPromise: fetch(proxyUrl).catch(() => null),
+    };
+  } catch (_) {}
 }
 
 async function fetchAllData() {
@@ -114,8 +147,162 @@ function showContent(url) {
 }
 
 // Short MP4 so Video.js + contrib-ads have real content; preroll runs before this plays.
-const IMA_PLACEHOLDER_CONTENT =
-  "https://storage.googleapis.com/gvabox/media/samples/stock.mp4";
+// (Removed) placeholder preview video: we want ad to be the first thing shown.
+
+function formatTime(totalSeconds) {
+  const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  return `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function attachAdUi(player, opts) {
+  const durationSeconds =
+    opts && Number.isFinite(opts.durationSeconds) ? opts.durationSeconds : null;
+  const skipOffsetSeconds =
+    opts && Number.isFinite(opts.skipOffsetSeconds) ? opts.skipOffsetSeconds : null;
+  const onSkip = opts && typeof opts.onSkip === "function" ? opts.onSkip : null;
+
+  // Hide default controls so user can't seek (no forward/back scrubber).
+  try {
+    player.controls(false);
+  } catch (_) {}
+
+  const box = document.getElementById("player-box");
+  if (!box) return () => {};
+
+  box.style.position = "relative";
+
+  const overlay = document.createElement("div");
+  overlay.className = "ad-overlay-ui";
+  overlay.style.position = "absolute";
+  overlay.style.left = "0";
+  overlay.style.right = "0";
+  overlay.style.bottom = "0";
+  overlay.style.padding = "10px 12px";
+  overlay.style.background =
+    "linear-gradient(to top, rgba(0,0,0,0.75), rgba(0,0,0,0.0))";
+  overlay.style.pointerEvents = "none";
+
+  const topRow = document.createElement("div");
+  topRow.style.display = "flex";
+  topRow.style.alignItems = "center";
+  topRow.style.justifyContent = "space-between";
+  topRow.style.gap = "10px";
+
+  const timeEl = document.createElement("div");
+  timeEl.style.color = "#fff";
+  timeEl.style.fontSize = "13px";
+  timeEl.style.fontWeight = "700";
+  timeEl.textContent = "Ad";
+
+  const skipBtn = document.createElement("button");
+  skipBtn.type = "button";
+  skipBtn.textContent = "Skip Ad";
+  skipBtn.style.pointerEvents = "auto";
+  skipBtn.style.display = "none";
+  skipBtn.style.padding = "8px 10px";
+  skipBtn.style.borderRadius = "10px";
+  skipBtn.style.border = "1px solid rgba(255,255,255,0.35)";
+  skipBtn.style.background = "rgba(0,0,0,0.45)";
+  skipBtn.style.color = "#fff";
+  skipBtn.style.fontSize = "13px";
+  skipBtn.style.fontWeight = "800";
+  skipBtn.addEventListener("click", () => {
+    if (onSkip) onSkip();
+  });
+
+  topRow.appendChild(timeEl);
+  topRow.appendChild(skipBtn);
+  overlay.appendChild(topRow);
+
+  const bar = document.createElement("div");
+  bar.style.marginTop = "10px";
+  bar.style.height = "3px";
+  bar.style.width = "100%";
+  bar.style.background = "rgba(255,255,255,0.25)";
+  bar.style.borderRadius = "999px";
+  bar.style.overflow = "hidden";
+
+  const barInner = document.createElement("div");
+  barInner.style.height = "100%";
+  barInner.style.width = "0%";
+  barInner.style.background = "#ffd400"; // yellow line
+  bar.appendChild(barInner);
+  overlay.appendChild(bar);
+
+  box.appendChild(overlay);
+
+  let lastTime = 0;
+  const preventSeek = () => {
+    try {
+      const ct = player.currentTime();
+      if (Math.abs(ct - lastTime) > 0.75) {
+        player.currentTime(lastTime);
+      }
+    } catch (_) {}
+  };
+
+  const onTimeUpdate = () => {
+    let ct = 0;
+    try {
+      ct = player.currentTime() || 0;
+    } catch (_) {}
+    lastTime = ct;
+
+    const d = durationSeconds || player.duration?.() || 0;
+    if (d && Number.isFinite(d) && d > 0) {
+      barInner.style.width = `${Math.max(0, Math.min(100, (ct / d) * 100))}%`;
+      timeEl.textContent = `Ad ${formatTime(ct)} / ${formatTime(d)}`;
+    } else {
+      timeEl.textContent = `Ad ${formatTime(ct)}`;
+    }
+
+    if (skipOffsetSeconds != null && Number.isFinite(skipOffsetSeconds)) {
+      skipBtn.style.display = "inline-flex";
+      if (ct >= skipOffsetSeconds) {
+        skipBtn.textContent = "Skip Ad";
+      } else {
+        skipBtn.textContent = `Skip in ${Math.ceil(skipOffsetSeconds - ct)}s`;
+      }
+    } else {
+      skipBtn.style.display = "none";
+    }
+  };
+
+  const onKeyDown = (e) => {
+    const k = e.key;
+    if (
+      k === "ArrowLeft" ||
+      k === "ArrowRight" ||
+      k === "j" ||
+      k === "l" ||
+      k === "J" ||
+      k === "L"
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
+
+  player.on("seeking", preventSeek);
+  player.on("timeupdate", onTimeUpdate);
+  document.addEventListener("keydown", onKeyDown, true);
+  onTimeUpdate();
+
+  return () => {
+    try {
+      player.off("seeking", preventSeek);
+      player.off("timeupdate", onTimeUpdate);
+    } catch (_) {}
+    document.removeEventListener("keydown", onKeyDown, true);
+    try {
+      overlay.remove();
+    } catch (_) {}
+  };
+}
 
 function runAdThenContent(url) {
   const box = document.getElementById("player-box");
@@ -140,7 +327,7 @@ function runAdThenContent(url) {
     return;
   }
 
-  const vastTagUrl = buildVastTagUrl();
+  const vastTagUrl = (_preloadedVast && _preloadedVast.vastTagUrl) || getSessionVastTagUrl();
   if (!vastTagUrl) {
     showContent(url);
     return;
@@ -158,6 +345,7 @@ function runAdThenContent(url) {
   const MIN_AD_WAIT_MS = 60000; // at least 60s wait for slow ad tags/CDNs
   let scheduledFallback = false;
   let shownContent = false;
+  let cleanupAdUi = null;
   const player = videojs("ad-player", {
     controls: true,
     autoplay: true,
@@ -183,6 +371,10 @@ function runAdThenContent(url) {
     }
     shownContent = true;
     try {
+      if (cleanupAdUi) cleanupAdUi();
+      cleanupAdUi = null;
+    } catch (_) {}
+    try {
       player.dispose();
     } catch (_) {}
     try {
@@ -191,6 +383,37 @@ function runAdThenContent(url) {
   }
 
   player.ready(function () {
+    // Fast path: try to play the VAST MP4 mediafile directly (prefetched/cached),
+    // so the very first thing the user sees is the ad (no stock preview video).
+    (async () => {
+      try {
+        const j =
+          (_preloadedVast && (await _preloadedVast.mediaPromise)) ||
+          (await fetch(
+            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+          ).then((r) => (r.ok ? r.json() : null)));
+
+        if (j?.media?.url) {
+          try {
+            if (cleanupAdUi) cleanupAdUi();
+          } catch (_) {}
+          cleanupAdUi = attachAdUi(player, {
+            durationSeconds:
+              j.durationSeconds != null ? Number(j.durationSeconds) : null,
+            skipOffsetSeconds:
+              j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
+            onSkip: () => safeShowContent("skip-click"),
+          });
+          player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
+          player.one("ended", () => safeShowContent("mediafile-ended"));
+          try {
+            await player.play();
+          } catch (_) {}
+          return;
+        }
+      } catch (_) {}
+    })();
+
     let imaPluginOk = true;
     if (typeof videojs !== "undefined" && typeof videojs.getPlugin === "function") {
       imaPluginOk = typeof videojs.getPlugin("ima") === "function";
@@ -205,6 +428,16 @@ function runAdThenContent(url) {
           if (!r.ok) throw new Error("vast-media");
           const j = await r.json();
           if (j?.media?.url) {
+            try {
+              if (cleanupAdUi) cleanupAdUi();
+            } catch (_) {}
+            cleanupAdUi = attachAdUi(player, {
+              durationSeconds:
+                j.durationSeconds != null ? Number(j.durationSeconds) : null,
+              skipOffsetSeconds:
+                j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
+              onSkip: () => safeShowContent("skip-click"),
+            });
             player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
             player.one("ended", () => safeShowContent("mediafile-ended"));
             try {
@@ -237,15 +470,11 @@ function runAdThenContent(url) {
       } catch (_) {}
     }
 
-    player.src({
-      src: IMA_PLACEHOLDER_CONTENT,
-      type: "video/mp4",
-    });
-
     try {
       // Many ad providers block direct browser fetch (CORS / bot rules / redirects).
       // Proxy via our server so IMA always loads from same origin.
       const proxiedVast =
+        (_preloadedVast && _preloadedVast.proxyUrl) ||
         `${API_BASE}/api/vast/proxy?tag=` + encodeURIComponent(vastTagUrl);
       player.ima({
         id: "ad-player",
@@ -275,15 +504,25 @@ function runAdThenContent(url) {
     setTimeout(async function () {
       if (shownContent || adStarted) return;
       try {
-        const r = await fetch(
-          `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
-        );
-        if (!r.ok) throw new Error("vast-media");
-        const j = await r.json();
+        const j =
+          (_preloadedVast && (await _preloadedVast.mediaPromise)) ||
+          (await fetch(
+            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+          ).then((r) => (r.ok ? r.json() : null)));
         if (j?.media?.url) {
           try {
             player.ima?.reset?.();
           } catch (_) {}
+          try {
+            if (cleanupAdUi) cleanupAdUi();
+          } catch (_) {}
+          cleanupAdUi = attachAdUi(player, {
+            durationSeconds:
+              j.durationSeconds != null ? Number(j.durationSeconds) : null,
+            skipOffsetSeconds:
+              j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
+            onSkip: () => safeShowContent("skip-click"),
+          });
           player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
           player.one("ended", () => safeShowContent("mediafile-ended"));
           try {
@@ -374,6 +613,9 @@ function renderEpisodes(movie, onSelect, currentSeason, currentEpisode) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  // Start fetching VAST early so ads start faster.
+  preloadAds();
+
   const movieKey = getQueryParam("key");
   const titleEl = document.getElementById("player-title");
   const overviewEl = document.getElementById("player-overview");
