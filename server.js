@@ -15,6 +15,37 @@ const __dirname = path.dirname(__filename);
 // Serve the front-end files from the same folder as server.js
 app.use(express.static(__dirname));
 
+// ---- Simple in-memory cache (per instance) ----
+const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
+const _cache = new Map();
+function _now() {
+  return Date.now();
+}
+function _normalizeTagKey(tag) {
+  // Strip common cache-busters so repeated plays reuse warm cache.
+  try {
+    const u = new URL(tag);
+    u.searchParams.delete("correlator");
+    u.searchParams.delete("cb");
+    u.searchParams.delete("cachebust");
+    return u.toString();
+  } catch (_) {
+    return String(tag || "");
+  }
+}
+function _cacheGet(key) {
+  const item = _cache.get(key);
+  if (!item) return null;
+  if (_now() - item.t > CACHE_TTL_MS) {
+    _cache.delete(key);
+    return null;
+  }
+  return item.v;
+}
+function _cacheSet(key, value) {
+  _cache.set(key, { t: _now(), v: value });
+}
+
 // WARNING: rotate this password in Atlas, never keep real creds in code for production.
 const MONGO_URI =
   process.env.MONGODB_URI ||
@@ -158,6 +189,13 @@ app.get("/api/vast/media", async (req, res) => {
   }
 
   try {
+    const cacheKey = "vast:media:" + _normalizeTagKey(tag);
+    const cached = _cacheGet(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
     const r = await fetch(tag, {
       headers: {
         "user-agent":
@@ -189,6 +227,33 @@ app.get("/api/vast/media", async (req, res) => {
             ? Number(durationMatchM[1]) * 60 + Number(durationMatchM[2])
             : null;
         })();
+
+    // Skip offset (VAST Linear skipoffset="HH:MM:SS" or "MM:SS" or "15%" or "15").
+    // We'll expose seconds when determinable; otherwise null.
+    const skipOffsetSeconds = (() => {
+      const m = xml.match(/<Linear[^>]*\sskipoffset="([^"]+)"[^>]*>/i);
+      if (!m) return null;
+      const raw = String(m[1] || "").trim();
+      if (!raw) return null;
+      if (raw.endsWith("%")) {
+        const pct = parseFloat(raw.slice(0, -1));
+        if (!Number.isFinite(pct) || durationSeconds == null) return null;
+        return Math.max(0, Math.floor((pct / 100) * durationSeconds));
+      }
+      // HH:MM:SS or MM:SS
+      const hms = raw.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+      if (hms) {
+        return Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3]);
+      }
+      const ms = raw.match(/^(\d{1,2}):(\d{2})$/);
+      if (ms) {
+        return Number(ms[1]) * 60 + Number(ms[2]);
+      }
+      // plain seconds
+      const secs = parseInt(raw, 10);
+      if (Number.isFinite(secs) && secs >= 0) return secs;
+      return null;
+    })();
 
     const escType = (t) => t.replace(/\//g, "\\/");
 
@@ -230,13 +295,104 @@ app.get("/api/vast/media", async (req, res) => {
     let media = extractMediaFile("video/mp4");
     if (!media) media = extractMediaFile("video/webm");
 
-    res.json({
+    const out = {
       durationSeconds,
+      skipOffsetSeconds,
       media,
-    });
+    };
+    res.json(out);
+    _cacheSet(cacheKey, out);
   } catch (e) {
     res.status(500).json({
       error: "VAST parsing failed",
+      message: e?.message ?? String(e),
+    });
+  }
+});
+
+// Proxy a VAST tag through this server (helps with CORS / blocked client fetches).
+// Returns the raw VAST XML (or whatever upstream returns).
+app.get("/api/vast/proxy", async (req, res) => {
+  const tag = req.query.tag;
+  if (!tag || typeof tag !== "string") {
+    res.status(400).json({ error: "tag query param is required" });
+    return;
+  }
+
+  try {
+    const cacheKey = "vast:proxy:" + _normalizeTagKey(tag);
+    const cached = _cacheGet(cacheKey);
+    if (cached) {
+      res.status(cached.status);
+      res.setHeader("content-type", cached.contentType);
+      res.send(cached.body);
+      return;
+    }
+
+    const r = await fetch(tag, {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastProxy",
+        accept: "application/xml,text/xml,*/*",
+      },
+      redirect: "follow",
+    });
+
+    const ct = r.headers.get("content-type") || "";
+    const body = await r.text();
+    res.status(r.status);
+    res.setHeader("content-type", ct || "application/xml; charset=utf-8");
+    res.send(body);
+    _cacheSet(cacheKey, {
+      status: r.status,
+      contentType: ct || "application/xml; charset=utf-8",
+      body,
+    });
+  } catch (e) {
+    res.status(502).json({
+      error: "failed to proxy VAST tag",
+      message: e?.message ?? String(e),
+    });
+  }
+});
+
+// Debug a VAST tag quickly: status, content-type, first bytes.
+app.get("/api/vast/debug", async (req, res) => {
+  const tag = req.query.tag;
+  if (!tag || typeof tag !== "string") {
+    res.status(400).json({ error: "tag query param is required" });
+    return;
+  }
+
+  try {
+    const cacheKey = "vast:debug:" + _normalizeTagKey(tag);
+    const cached = _cacheGet(cacheKey);
+    if (cached) {
+      res.json(cached);
+      return;
+    }
+
+    const r = await fetch(tag, {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastProxy",
+        accept: "application/xml,text/xml,*/*",
+      },
+      redirect: "follow",
+    });
+    const ct = r.headers.get("content-type") || "";
+    const body = await r.text();
+    const out = {
+      ok: r.ok,
+      status: r.status,
+      contentType: ct,
+      snippet: body.slice(0, 800),
+    };
+    res.json(out);
+    _cacheSet(cacheKey, out);
+  } catch (e) {
+    res.status(502).json({
+      error: "failed to debug VAST tag",
       message: e?.message ?? String(e),
     });
   }
