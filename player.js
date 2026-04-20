@@ -5,9 +5,9 @@ const STORAGE_KEY = "flakes_movies_data";
 // whatever tag you give. If the server returns empty VAST (no <Ad>), you get no ad on ANY tag.
 // Optional test override: player.html?key=...&adtag=ENCODED_FULL_TAG_URL
 const VAST_TAG_URL_BASE =
-  "https://exalted-engineering.com/damVF-z.dfGANDvxZqG/Ua/zefm_9FueZsUbl/kIPxTxYI5mNzz_YOwyNADwUZt/NjjCkJ3BNijuAO0/OeQX";
+  "https://exalted-engineering.com/d/mAFRzYd.GdNhvQZbG/UJ/ie/ms9nu/ZrUslHkNP_TNYc5kNhzlYxwCNiDIUBtxNQjikq3/N_jJA/0pOBQs";
 
-// Use same-origin API in production (Render), still works locally.
+// Use same-origin API in producti(on Renedr), still works locally.
 const API_BASE =
   window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
     ? "http://localhost:3001"
@@ -220,8 +220,9 @@ function runAdThenContent(url) {
           pageUrl: imaPageUrl,
         },
         contribAdsSettings: {
-          timeout: 30000,
-          prerollTimeout: 20000,
+          // Slow VAST/CDN tags need more time before we fallback to content.
+          timeout: 90000,
+          prerollTimeout: 60000,
         },
       });
     } catch (_) {
@@ -264,7 +265,7 @@ function runAdThenContent(url) {
     setTimeout(function () {
       if (document.querySelector("#player-box iframe")) return;
       safeShowContent("timeout");
-    }, 120000);
+    }, 240000);
   });
 }
 
