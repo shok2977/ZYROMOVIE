@@ -154,6 +154,9 @@ function runAdThenContent(url) {
     return "http://localhost:3001/player.html";
   })();
 
+  const startedAtMs = Date.now();
+  const MIN_AD_WAIT_MS = 60000; // at least 60s wait for slow ad tags/CDNs
+  let scheduledFallback = false;
   let shownContent = false;
   const player = videojs("ad-player", {
     controls: true,
@@ -166,8 +169,18 @@ function runAdThenContent(url) {
     height: 500,
   });
 
-  function safeShowContent(/* reason */) {
+  function safeShowContent(reason) {
     if (shownContent) return;
+    // If ad fails quickly, still wait a bit before falling back to content.
+    // This helps slow VAST/redirect chains that often trigger early errors.
+    const elapsed = Date.now() - startedAtMs;
+    if (elapsed < MIN_AD_WAIT_MS) {
+      if (!scheduledFallback) {
+        scheduledFallback = true;
+        setTimeout(() => safeShowContent("min-wait-elapsed"), MIN_AD_WAIT_MS - elapsed);
+      }
+      return;
+    }
     shownContent = true;
     try {
       player.dispose();
@@ -183,7 +196,25 @@ function runAdThenContent(url) {
       imaPluginOk = typeof videojs.getPlugin("ima") === "function";
     }
     if (typeof google === "undefined" || !google.ima || !imaPluginOk) {
-      safeShowContent("ima-missing");
+      // No IMA available — try direct mediafile preroll, else fallback to content.
+      (async () => {
+        try {
+          const r = await fetch(
+            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+          );
+          if (!r.ok) throw new Error("vast-media");
+          const j = await r.json();
+          if (j?.media?.url) {
+            player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
+            player.one("ended", () => safeShowContent("mediafile-ended"));
+            try {
+              await player.play();
+            } catch (_) {}
+            return;
+          }
+        } catch (_) {}
+        safeShowContent("ima-missing");
+      })();
       return;
     }
 
@@ -212,12 +243,17 @@ function runAdThenContent(url) {
     });
 
     try {
+      // Many ad providers block direct browser fetch (CORS / bot rules / redirects).
+      // Proxy via our server so IMA always loads from same origin.
+      const proxiedVast =
+        `${API_BASE}/api/vast/proxy?tag=` + encodeURIComponent(vastTagUrl);
       player.ima({
         id: "ad-player",
-        adTagUrl: vastTagUrl,
+        adTagUrl: proxiedVast,
         vpaidMode: google.ima.ImaSdkSettings.VpaidMode.ENABLED,
         adsRequest: {
           pageUrl: imaPageUrl,
+          vastLoadTimeout: 90000,
         },
         contribAdsSettings: {
           // Slow VAST/CDN tags need more time before we fallback to content.
@@ -229,6 +265,35 @@ function runAdThenContent(url) {
       safeShowContent("ima-plugin");
       return;
     }
+
+    // If IMA doesn't start any ad within a grace period, force mediafile preroll.
+    let adStarted = false;
+    player.one("ads-ad-started", function () {
+      adStarted = true;
+    });
+
+    setTimeout(async function () {
+      if (shownContent || adStarted) return;
+      try {
+        const r = await fetch(
+          `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+        );
+        if (!r.ok) throw new Error("vast-media");
+        const j = await r.json();
+        if (j?.media?.url) {
+          try {
+            player.ima?.reset?.();
+          } catch (_) {}
+          player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
+          player.one("ended", () => safeShowContent("mediafile-ended"));
+          try {
+            await player.play();
+          } catch (_) {}
+          return;
+        }
+      } catch (_) {}
+      safeShowContent("ima-no-start");
+    }, 20000);
 
     player.on("ads-manager", function (ev) {
       bindAllAdsCompleted(ev);
