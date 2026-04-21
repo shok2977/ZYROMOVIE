@@ -255,6 +255,47 @@ app.get("/api/vast/media", async (req, res) => {
       return null;
     })();
 
+    const extractCdataUrls = (re) => {
+      const out = [];
+      const matches = xml.match(re) || [];
+      for (const block of matches) {
+        const cdata = block.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+        const url = String((cdata ? cdata[1] : "") || "").trim();
+        if (url) out.push(url);
+      }
+      return out;
+    };
+
+    // ClickThrough URL (open in new tab on user click)
+    const clickThroughUrl = (() => {
+      const m = xml.match(
+        /<ClickThrough[^>]*>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/ClickThrough>/i
+      );
+      const url = String((m && m[1]) || "").trim();
+      return url || null;
+    })();
+
+    // Trackers (we'll ping these server-side to avoid CORS issues)
+    const impressionUrls = extractCdataUrls(/<Impression[^>]*>[\s\S]*?<\/Impression>/gi);
+    const clickTrackingUrls = extractCdataUrls(
+      /<ClickTracking[^>]*>[\s\S]*?<\/ClickTracking>/gi
+    );
+    const trackingEvents = {
+      start: extractCdataUrls(/<Tracking[^>]*event="start"[^>]*>[\s\S]*?<\/Tracking>/gi),
+      firstQuartile: extractCdataUrls(
+        /<Tracking[^>]*event="firstQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
+      ),
+      midpoint: extractCdataUrls(
+        /<Tracking[^>]*event="midpoint"[^>]*>[\s\S]*?<\/Tracking>/gi
+      ),
+      thirdQuartile: extractCdataUrls(
+        /<Tracking[^>]*event="thirdQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
+      ),
+      complete: extractCdataUrls(
+        /<Tracking[^>]*event="complete"[^>]*>[\s\S]*?<\/Tracking>/gi
+      ),
+    };
+
     const escType = (t) => t.replace(/\//g, "\\/");
 
     // VAST MediaFile URLs usually live inside CDATA. Regex match can be fragile
@@ -298,6 +339,10 @@ app.get("/api/vast/media", async (req, res) => {
     const out = {
       durationSeconds,
       skipOffsetSeconds,
+      clickThroughUrl,
+      impressionUrls,
+      clickTrackingUrls,
+      trackingEvents,
       media,
     };
     res.json(out);
@@ -307,6 +352,29 @@ app.get("/api/vast/media", async (req, res) => {
       error: "VAST parsing failed",
       message: e?.message ?? String(e),
     });
+  }
+});
+
+// Fire-and-forget tracker pings server-side (avoids CORS).
+// Usage: /api/vast/track?u=ENCODED_URL
+app.get("/api/vast/track", async (req, res) => {
+  const u = req.query.u;
+  if (!u || typeof u !== "string") {
+    res.status(400).json({ error: "u query param is required" });
+    return;
+  }
+  try {
+    const r = await fetch(u, {
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastTracker",
+        accept: "*/*",
+      },
+      redirect: "follow",
+    });
+    res.json({ ok: r.ok, status: r.status });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: e?.message ?? String(e) });
   }
 });
 

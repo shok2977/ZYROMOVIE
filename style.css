@@ -446,6 +446,7 @@ body {
   background-color: #000;
   border-radius: 16px;
   overflow: hidden;
+  position: relative;
 }
 
 .player-error {

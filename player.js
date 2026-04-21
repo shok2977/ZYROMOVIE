@@ -5,7 +5,7 @@ const STORAGE_KEY = "flakes_movies_data";
 // whatever tag you give. If the server returns empty VAST (no <Ad>), you get no ad on ANY tag.
 // Optional test override: player.html?key=...&adtag=ENCODED_FULL_TAG_URL
 const VAST_TAG_URL_BASE =
-  "https://exalted-engineering.com/d/mAFRzYd.GdNhvQZbG/UJ/ie/ms9nu/ZrUslHkNP_TNYc5kNhzlYxwCNiDIUBtxNQjikq3/N_jJA/0pOBQs";
+  "https://exalted-engineering.com/dQm.FJzGdyGLNjvHZCGvUe/CeNme9WuIZxUpl/kTPvTBYC5bNAztY/woNoDcU_trNFjbks3uN/jwAj0QOiQK";
 
 // Use same-origin API in producti(on Renedr), still works locally.
 const API_BASE =
@@ -148,6 +148,8 @@ function showContent(url) {
 
 // Short MP4 so Video.js + contrib-ads have real content; preroll runs before this plays.
 // (Removed) placeholder preview video: we want ad to be the first thing shown.
+const IMA_BOOTSTRAP_CONTENT =
+  "https://storage.googleapis.com/gvabox/media/samples/stock.mp4";
 
 function formatTime(totalSeconds) {
   const s = Math.max(0, Math.floor(Number(totalSeconds) || 0));
@@ -164,6 +166,14 @@ function attachAdUi(player, opts) {
   const skipOffsetSeconds =
     opts && Number.isFinite(opts.skipOffsetSeconds) ? opts.skipOffsetSeconds : null;
   const onSkip = opts && typeof opts.onSkip === "function" ? opts.onSkip : null;
+  const clickThroughUrl =
+    opts && typeof opts.clickThroughUrl === "string" && opts.clickThroughUrl.trim()
+      ? opts.clickThroughUrl.trim()
+      : null;
+  const impressionUrls = Array.isArray(opts?.impressionUrls) ? opts.impressionUrls : [];
+  const clickTrackingUrls = Array.isArray(opts?.clickTrackingUrls)
+    ? opts.clickTrackingUrls
+    : [];
 
   // Hide default controls so user can't seek (no forward/back scrubber).
   try {
@@ -235,6 +245,31 @@ function attachAdUi(player, opts) {
 
   box.appendChild(overlay);
 
+  // Fire impression trackers once when ad starts playing.
+  let didFireImpression = false;
+  const fireTrackers = (urls) => {
+    (urls || []).forEach((u) => {
+      if (!u) return;
+      fetch(`${API_BASE}/api/vast/track?u=` + encodeURIComponent(u)).catch(() => {});
+    });
+  };
+
+  const onPlay = () => {
+    if (didFireImpression) return;
+    didFireImpression = true;
+    fireTrackers(impressionUrls);
+  };
+
+  // Click-through: user click on video opens advertiser URL (new tab),
+  // and we ping click trackers.
+  const onClick = () => {
+    if (!clickThroughUrl) return;
+    fireTrackers(clickTrackingUrls);
+    try {
+      window.open(clickThroughUrl, "_blank", "noopener,noreferrer");
+    } catch (_) {}
+  };
+
   let lastTime = 0;
   const preventSeek = () => {
     try {
@@ -289,6 +324,8 @@ function attachAdUi(player, opts) {
 
   player.on("seeking", preventSeek);
   player.on("timeupdate", onTimeUpdate);
+  player.on("play", onPlay);
+  player.on("click", onClick);
   document.addEventListener("keydown", onKeyDown, true);
   onTimeUpdate();
 
@@ -296,6 +333,8 @@ function attachAdUi(player, opts) {
     try {
       player.off("seeking", preventSeek);
       player.off("timeupdate", onTimeUpdate);
+      player.off("play", onPlay);
+      player.off("click", onClick);
     } catch (_) {}
     document.removeEventListener("keydown", onKeyDown, true);
     try {
@@ -311,8 +350,7 @@ function runAdThenContent(url) {
   box.innerHTML = `
     <video
       id="ad-player"
-      class="video-js vjs-default-skin vjs-big-play-centered"
-      controls
+      class="video-js vjs-default-skin"
       playsinline
       width="100%"
       height="500"
@@ -333,244 +371,219 @@ function runAdThenContent(url) {
     return;
   }
 
-  const imaPageUrl = (function () {
-    try {
-      const h = String(window.location.href || "");
-      if (h && !h.startsWith("file:")) return h;
-    } catch (_) {}
-    return "http://localhost:3001/player.html";
-  })();
-
-  const startedAtMs = Date.now();
-  const MIN_AD_WAIT_MS = 60000; // at least 60s wait for slow ad tags/CDNs
-  let scheduledFallback = false;
-  let shownContent = false;
-  let cleanupAdUi = null;
-  const player = videojs("ad-player", {
-    controls: true,
-    autoplay: true,
-    muted: true,
-    playsinline: true,
-    preload: "auto",
-    fluid: false,
-    width: "100%",
-    height: 500,
-  });
-
-  function safeShowContent(reason) {
-    if (shownContent) return;
-    // If ad fails quickly, still wait a bit before falling back to content.
-    // This helps slow VAST/redirect chains that often trigger early errors.
-    const elapsed = Date.now() - startedAtMs;
-    if (elapsed < MIN_AD_WAIT_MS) {
-      if (!scheduledFallback) {
-        scheduledFallback = true;
-        setTimeout(() => safeShowContent("min-wait-elapsed"), MIN_AD_WAIT_MS - elapsed);
-      }
-      return;
-    }
-    shownContent = true;
-    try {
-      if (cleanupAdUi) cleanupAdUi();
-      cleanupAdUi = null;
-    } catch (_) {}
-    try {
-      player.dispose();
-    } catch (_) {}
-    try {
-      showContent(url);
-    } catch (_) {}
+  const videoEl = box.querySelector("#ad-player");
+  if (!videoEl) {
+    showContent(url);
+    return;
   }
 
-  player.ready(function () {
-    // Fast path: try to play the VAST MP4 mediafile directly (prefetched/cached),
-    // so the very first thing the user sees is the ad (no stock preview video).
-    (async () => {
-      try {
-        const j =
-          (_preloadedVast && (await _preloadedVast.mediaPromise)) ||
-          (await fetch(
-            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
-          ).then((r) => (r.ok ? r.json() : null)));
+  let switched = false;
+  const safeShowContent = () => {
+    if (switched) return;
+    switched = true;
+    showContent(url);
+  };
 
-        if (j?.media?.url) {
-          try {
-            if (cleanupAdUi) cleanupAdUi();
-          } catch (_) {}
-          cleanupAdUi = attachAdUi(player, {
-            durationSeconds:
-              j.durationSeconds != null ? Number(j.durationSeconds) : null,
-            skipOffsetSeconds:
-              j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
-            onSkip: () => safeShowContent("skip-click"),
-          });
-          player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
-          player.one("ended", () => safeShowContent("mediafile-ended"));
-          try {
-            await player.play();
-          } catch (_) {}
-          return;
+  const formatPlayhead = (secs) => {
+    const s = Math.max(0, Number(secs) || 0);
+    const hh = Math.floor(s / 3600);
+    const mm = Math.floor((s % 3600) / 60);
+    const ss = Math.floor(s % 60);
+    const ms = Math.floor((s - Math.floor(s)) * 1000);
+    return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
+  };
+
+  const normalizeTrackerUrl = (raw, currentTime = 0) => {
+    const now = Date.now();
+    const cb = `${now}${Math.floor(Math.random() * 1e7)}`;
+    return String(raw || "")
+      .replace(/\[TIMESTAMP\]/gi, encodeURIComponent(new Date(now).toISOString()))
+      .replace(/\[CACHEBUSTING\]/gi, cb)
+      .replace(/\[RANDOM\]/gi, cb)
+      .replace(/\[CACHEBUSTER\]/gi, cb)
+      .replace(/\[CONTENTPLAYHEAD\]/gi, encodeURIComponent(formatPlayhead(currentTime)))
+      .replace(/\[ERRORCODE\]/gi, "405");
+  };
+
+  const pingTrackers = (urls, currentTime = 0) => {
+    (urls || []).forEach((u) => {
+      const finalUrl = normalizeTrackerUrl(u, currentTime);
+      if (!finalUrl) return;
+      try {
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(finalUrl, new Blob([], { type: "text/plain" }));
         }
       } catch (_) {}
-    })();
-
-    let imaPluginOk = true;
-    if (typeof videojs !== "undefined" && typeof videojs.getPlugin === "function") {
-      imaPluginOk = typeof videojs.getPlugin("ima") === "function";
-    }
-    if (typeof google === "undefined" || !google.ima || !imaPluginOk) {
-      // No IMA available — try direct mediafile preroll, else fallback to content.
-      (async () => {
-        try {
-          const r = await fetch(
-            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
-          );
-          if (!r.ok) throw new Error("vast-media");
-          const j = await r.json();
-          if (j?.media?.url) {
-            try {
-              if (cleanupAdUi) cleanupAdUi();
-            } catch (_) {}
-            cleanupAdUi = attachAdUi(player, {
-              durationSeconds:
-                j.durationSeconds != null ? Number(j.durationSeconds) : null,
-              skipOffsetSeconds:
-                j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
-              onSkip: () => safeShowContent("skip-click"),
-            });
-            player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
-            player.one("ended", () => safeShowContent("mediafile-ended"));
-            try {
-              await player.play();
-            } catch (_) {}
-            return;
-          }
-        } catch (_) {}
-        safeShowContent("ima-missing");
-      })();
-      return;
-    }
-
-    let allAdsCompletedBound = false;
-    function bindAllAdsCompleted(ev) {
-      if (allAdsCompletedBound) return;
       try {
-        const ctrl = player.ima;
-        const mgr =
-          (ev && ev.adsManager) ||
-          (ctrl && ctrl.getAdsManager && ctrl.getAdsManager());
-        if (!mgr || !mgr.addEventListener) return;
-        allAdsCompletedBound = true;
-        mgr.addEventListener(
-          google.ima.AdEvent.Type.ALL_ADS_COMPLETED,
-          function () {
-            safeShowContent("ALL_ADS_COMPLETED");
-          }
-        );
+        const img = new Image();
+        img.referrerPolicy = "no-referrer-when-downgrade";
+        img.src = finalUrl;
       } catch (_) {}
-    }
+    });
+  };
 
+  (async () => {
     try {
-      // Many ad providers block direct browser fetch (CORS / bot rules / redirects).
-      // Proxy via our server so IMA always loads from same origin.
-      const proxiedVast =
-        (_preloadedVast && _preloadedVast.proxyUrl) ||
-        `${API_BASE}/api/vast/proxy?tag=` + encodeURIComponent(vastTagUrl);
-      player.ima({
-        id: "ad-player",
-        adTagUrl: proxiedVast,
-        vpaidMode: google.ima.ImaSdkSettings.VpaidMode.ENABLED,
-        adsRequest: {
-          pageUrl: imaPageUrl,
-          vastLoadTimeout: 90000,
-        },
-        contribAdsSettings: {
-          // Slow VAST/CDN tags need more time before we fallback to content.
-          timeout: 90000,
-          prerollTimeout: 60000,
-        },
+      const r = await fetch(
+        `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+      );
+      if (!r.ok) {
+        safeShowContent();
+        return;
+      }
+      const ad = await r.json();
+      if (!ad?.media?.url) {
+        safeShowContent();
+        return;
+      }
+
+      let impressionSent = false;
+      let startTracked = false;
+      let q1Tracked = false;
+      let midTracked = false;
+      let q3Tracked = false;
+      let completeTracked = false;
+      let skipEnabled = false;
+      const skipOffset = Number.isFinite(Number(ad.skipOffsetSeconds))
+        ? Number(ad.skipOffsetSeconds)
+        : null;
+      const track = ad.trackingEvents || {};
+
+      // Optional skip button (only if provider allows via skipoffset).
+      let skipBtn = null;
+      if (skipOffset != null) {
+        skipBtn = document.createElement("button");
+        skipBtn.type = "button";
+        skipBtn.textContent = `Skip in ${Math.ceil(skipOffset)}s`;
+        skipBtn.style.position = "absolute";
+        skipBtn.style.right = "16px";
+        skipBtn.style.bottom = "18px";
+        skipBtn.style.zIndex = "15";
+        skipBtn.style.padding = "8px 10px";
+        skipBtn.style.borderRadius = "8px";
+        skipBtn.style.border = "1px solid rgba(255,255,255,0.35)";
+        skipBtn.style.background = "rgba(0,0,0,0.55)";
+        skipBtn.style.color = "#fff";
+        skipBtn.style.cursor = "not-allowed";
+        skipBtn.disabled = true;
+        box.appendChild(skipBtn);
+        skipBtn.addEventListener("click", () => {
+          if (!skipEnabled) return;
+          safeShowContent();
+        });
+      }
+
+      videoEl.style.width = "100%";
+      videoEl.style.height = "500px";
+      videoEl.style.background = "#000";
+      videoEl.style.cursor = ad.clickThroughUrl ? "pointer" : "default";
+      videoEl.playsInline = true;
+      videoEl.muted = true;
+      videoEl.autoplay = true;
+      videoEl.controls = false;
+      videoEl.src = ad.media.url;
+
+      // Ensure visible clickable cursor and click target on top of video.
+      let clickLayer = null;
+      if (ad.clickThroughUrl) {
+        clickLayer = document.createElement("button");
+        clickLayer.type = "button";
+        clickLayer.setAttribute("aria-label", "Open advertiser");
+        clickLayer.style.position = "absolute";
+        clickLayer.style.inset = "0";
+        clickLayer.style.zIndex = "12";
+        clickLayer.style.background = "transparent";
+        clickLayer.style.border = "0";
+        clickLayer.style.cursor = "pointer";
+        clickLayer.style.padding = "0";
+        clickLayer.style.margin = "0";
+        box.appendChild(clickLayer);
+      }
+
+      videoEl.addEventListener("playing", () => {
+        if (impressionSent) return;
+        impressionSent = true;
+        pingTrackers(ad.impressionUrls || [], videoEl.currentTime || 0);
+        if (!startTracked) {
+          startTracked = true;
+          pingTrackers(track.start || [], videoEl.currentTime || 0);
+        }
       });
-    } catch (_) {
-      safeShowContent("ima-plugin");
-      return;
-    }
 
-    // If IMA doesn't start any ad within a grace period, force mediafile preroll.
-    let adStarted = false;
-    player.one("ads-ad-started", function () {
-      adStarted = true;
-    });
-
-    setTimeout(async function () {
-      if (shownContent || adStarted) return;
-      try {
-        const j =
-          (_preloadedVast && (await _preloadedVast.mediaPromise)) ||
-          (await fetch(
-            `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
-          ).then((r) => (r.ok ? r.json() : null)));
-        if (j?.media?.url) {
-          try {
-            player.ima?.reset?.();
-          } catch (_) {}
-          try {
-            if (cleanupAdUi) cleanupAdUi();
-          } catch (_) {}
-          cleanupAdUi = attachAdUi(player, {
-            durationSeconds:
-              j.durationSeconds != null ? Number(j.durationSeconds) : null,
-            skipOffsetSeconds:
-              j.skipOffsetSeconds != null ? Number(j.skipOffsetSeconds) : null,
-            onSkip: () => safeShowContent("skip-click"),
-          });
-          player.src({ src: j.media.url, type: j.media.type || "video/mp4" });
-          player.one("ended", () => safeShowContent("mediafile-ended"));
-          try {
-            await player.play();
-          } catch (_) {}
-          return;
+      videoEl.addEventListener("timeupdate", () => {
+        const ct = videoEl.currentTime || 0;
+        const d =
+          Number.isFinite(Number(ad.durationSeconds)) && Number(ad.durationSeconds) > 0
+            ? Number(ad.durationSeconds)
+            : videoEl.duration || 0;
+        if (d > 0) {
+          const p = ct / d;
+          if (!q1Tracked && p >= 0.25) {
+            q1Tracked = true;
+            pingTrackers(track.firstQuartile || [], ct);
+          }
+          if (!midTracked && p >= 0.5) {
+            midTracked = true;
+            pingTrackers(track.midpoint || [], ct);
+          }
+          if (!q3Tracked && p >= 0.75) {
+            q3Tracked = true;
+            pingTrackers(track.thirdQuartile || [], ct);
+          }
         }
-      } catch (_) {}
-      safeShowContent("ima-no-start");
-    }, 20000);
 
-    player.on("ads-manager", function (ev) {
-      bindAllAdsCompleted(ev);
-    });
-    player.one("ads-ad-started", function () {
-      bindAllAdsCompleted();
-    });
+        if (skipBtn && !skipEnabled) {
+          const left = skipOffset - ct;
+          if (left <= 0) {
+            skipEnabled = true;
+            skipBtn.disabled = false;
+            skipBtn.textContent = "Skip Ad";
+            skipBtn.style.cursor = "pointer";
+          } else {
+            skipBtn.textContent = `Skip in ${Math.ceil(left)}s`;
+          }
+        }
+      });
 
-    player.on("adserror", function () {
-      safeShowContent("adserror");
-    });
+      videoEl.addEventListener("click", () => {
+        if (ad.clickThroughUrl) {
+          pingTrackers(ad.clickTrackingUrls || [], videoEl.currentTime || 0);
+          window.open(ad.clickThroughUrl, "_blank", "noopener,noreferrer");
+        }
+      });
+      if (clickLayer) {
+        clickLayer.addEventListener("click", () => {
+          pingTrackers(ad.clickTrackingUrls || [], videoEl.currentTime || 0);
+          window.open(ad.clickThroughUrl, "_blank", "noopener,noreferrer");
+        });
+      }
 
-    // IMA requires AdDisplayContainer.initialize() from a user gesture on many browsers
-    // (esp. mobile). Capture phase runs before Video.js big-play-button so preroll can start.
-    const el = player.el();
-    const primeImaFromUser = function () {
+      videoEl.addEventListener("ended", () => {
+        if (!completeTracked) {
+          completeTracked = true;
+          pingTrackers(track.complete || [], videoEl.currentTime || 0);
+        }
+        try {
+          if (clickLayer) clickLayer.remove();
+        } catch (_) {}
+        safeShowContent();
+      });
+      videoEl.addEventListener("error", () => {
+        try {
+          if (clickLayer) clickLayer.remove();
+        } catch (_) {}
+        safeShowContent();
+      });
+
       try {
-        player.ima.initializeAdDisplayContainer();
-      } catch (_) {}
-    };
-    el.addEventListener("click", primeImaFromUser, true);
-    el.addEventListener("touchend", primeImaFromUser, {
-      capture: true,
-      passive: true,
-    });
-    el.addEventListener("keydown", primeImaFromUser, true);
-
-    try {
-      player.play().catch(function () {});
+        await videoEl.play();
+      } catch (_) {
+        safeShowContent();
+      }
     } catch (_) {
-      safeShowContent("ima-init");
+      safeShowContent();
     }
-
-    setTimeout(function () {
-      if (document.querySelector("#player-box iframe")) return;
-      safeShowContent("timeout");
-    }, 240000);
-  });
+  })();
 }
 
 function renderEpisodes(movie, onSelect, currentSeason, currentEpisode) {
