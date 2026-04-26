@@ -121,13 +121,13 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
   leftBtn.type = "button";
   leftBtn.className = "movie-list-nav movie-list-nav-left";
   leftBtn.setAttribute("aria-label", "Scroll left");
-  leftBtn.innerHTML = "‹";
+  leftBtn.textContent = "<";
 
   const rightBtn = document.createElement("button");
   rightBtn.type = "button";
   rightBtn.className = "movie-list-nav movie-list-nav-right";
   rightBtn.setAttribute("aria-label", "Scroll right");
-  rightBtn.innerHTML = "›";
+  rightBtn.textContent = ">";
 
   const listEl = document.createElement("div");
   listEl.className = "movie-list";
@@ -165,11 +165,13 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
     listEl.appendChild(item);
   });
 
+  // NOTE: sliding should only happen via buttons (no wheel/touch scroll).
+
   leftBtn.addEventListener("click", () => {
-    wrapper.scrollBy({ left: -900, behavior: "smooth" });
+    wrapper.scrollBy({ left: -850, behavior: "smooth" });
   });
   rightBtn.addEventListener("click", () => {
-    wrapper.scrollBy({ left: 900, behavior: "smooth" });
+    wrapper.scrollBy({ left: 850, behavior: "smooth" });
   });
 
   wrapper.appendChild(listEl);
@@ -216,7 +218,7 @@ async function renderDynamicLists() {
     appendMovieListSection(root, data, listName, movieIds);
   });
 
-  // Random rows always at bottom: every title; 10 per row; shuffled each load.
+  // Random rows at bottom: every title; 10 per row; shuffled each load.
   if (allKeys.length) {
     const shuffledAll = shuffleArray(allKeys);
     const parts = chunkArray(shuffledAll, RANDOM_ROW_SIZE);
@@ -336,35 +338,14 @@ async function initBannerSlider() {
 
   const slideHost = document.createElement("div");
   slideHost.className = "banner-slide-host";
+  const track = document.createElement("div");
+  track.className = "banner-track";
+  slideHost.appendChild(track);
   root.appendChild(slideHost);
 
   const dotsHost = document.createElement("div");
   dotsHost.className = "banner-dots";
   root.appendChild(dotsHost);
-
-  const controls = document.createElement("div");
-  controls.className = "banner-controls";
-  const prevBtn = document.createElement("button");
-  prevBtn.type = "button";
-  prevBtn.className = "banner-control-btn";
-  prevBtn.textContent = "‹";
-  prevBtn.addEventListener("click", () => {
-    stopTimer();
-    goTo(currentIndex - 1);
-    startTimer();
-  });
-  const nextBtn = document.createElement("button");
-  nextBtn.type = "button";
-  nextBtn.className = "banner-control-btn";
-  nextBtn.textContent = "›";
-  nextBtn.addEventListener("click", () => {
-    stopTimer();
-    goTo(currentIndex + 1);
-    startTimer();
-  });
-  controls.appendChild(prevBtn);
-  controls.appendChild(nextBtn);
-  root.appendChild(controls);
 
   const buildSlide = (banner) => {
     const slide = document.createElement("div");
@@ -389,22 +370,38 @@ async function initBannerSlider() {
     desc.textContent = banner.description || "";
     overlay.appendChild(desc);
 
+    const cta = document.createElement("button");
+    cta.type = "button";
+    cta.className = "banner-slide-cta";
+    cta.textContent = "Play Now";
+    cta.addEventListener("click", (e) => {
+      e.stopPropagation();
+      goToBannerTarget(banner);
+    });
+    overlay.appendChild(cta);
+
     slide.appendChild(overlay);
     slide.addEventListener("click", () => goToBannerTarget(banner));
     return slide;
   };
 
-  const goTo = (idx) => {
-    if (!banners.length) return;
-    currentIndex = (idx + banners.length) % banners.length;
-    slideHost.innerHTML = "";
-    slideHost.appendChild(buildSlide(banners[currentIndex]));
+  const slideEls = banners.map((b) => buildSlide(b));
+  slideEls.forEach((el) => track.appendChild(el));
 
+  const updateTrack = () => {
+    track.style.transform = `translateX(-${currentIndex * 100}%)`;
+    slideEls.forEach((el, i) => {
+      el.classList.toggle("active", i === currentIndex);
+    });
+  };
+
+  const renderDots = () => {
     dotsHost.innerHTML = "";
     banners.forEach((_, i) => {
       const dot = document.createElement("button");
       dot.className = "banner-dot" + (i === currentIndex ? " active" : "");
       dot.type = "button";
+      dot.setAttribute("aria-label", `Go to banner ${i + 1}`);
       dot.addEventListener("click", () => {
         stopTimer();
         goTo(i);
@@ -412,6 +409,13 @@ async function initBannerSlider() {
       });
       dotsHost.appendChild(dot);
     });
+  };
+
+  const goTo = (idx) => {
+    if (!banners.length) return;
+    currentIndex = (idx + banners.length) % banners.length;
+    updateTrack();
+    renderDots();
   };
 
   const stopTimer = () => {
@@ -425,6 +429,59 @@ async function initBannerSlider() {
       goTo(currentIndex + 1);
     }, 5000);
   };
+
+  // Netflix-like UX: pause auto-slide while hovering/focusing the hero.
+  root.addEventListener("mouseenter", stopTimer);
+  root.addEventListener("mouseleave", startTimer);
+  root.addEventListener("focusin", stopTimer);
+  root.addEventListener("focusout", startTimer);
+
+  // Mobile swipe support for banner slider.
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let dragging = false;
+  slideHost.addEventListener(
+    "touchstart",
+    (e) => {
+      const t = e.changedTouches && e.changedTouches[0];
+      if (!t) return;
+      dragging = true;
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+    },
+    { passive: true }
+  );
+  slideHost.addEventListener(
+    "touchend",
+    (e) => {
+      if (!dragging) return;
+      dragging = false;
+      const t = e.changedTouches && e.changedTouches[0];
+      if (!t) return;
+      const dx = t.clientX - touchStartX;
+      const dy = t.clientY - touchStartY;
+      if (Math.abs(dx) < 35 || Math.abs(dx) < Math.abs(dy)) return;
+      stopTimer();
+      if (dx < 0) goTo(currentIndex + 1);
+      else goTo(currentIndex - 1);
+      startTimer();
+    },
+    { passive: true }
+  );
+
+  // Keyboard support
+  root.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") {
+      stopTimer();
+      goTo(currentIndex - 1);
+      startTimer();
+    } else if (e.key === "ArrowRight") {
+      stopTimer();
+      goTo(currentIndex + 1);
+      startTimer();
+    }
+  });
+  root.tabIndex = 0;
 
   goTo(0);
   startTimer();
