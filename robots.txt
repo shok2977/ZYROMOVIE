@@ -1,5 +1,7 @@
 User-agent: *
 Allow: /
+Disallow: /admin/
+Disallow: /admin.html
+Disallow: /admin/index.html
 
 Sitemap: https://zyromovie.onrender.com/sitemap.xml
-

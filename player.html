@@ -50,6 +50,15 @@
         height: 500px;
         border: 0;
       }
+      #player-box .zyro-preroll-video {
+        display: block;
+        width: 100%;
+        height: 500px;
+        object-fit: contain;
+        background: #000;
+        position: relative;
+        z-index: 1;
+      }
       /* Video.js + IMA: fill player area (linear + many VPAID creatives) */
       #player-box .video-js {
         width: 100% !important;
@@ -124,6 +133,7 @@
     </div>
     
 
+    <script src="api-config.js"></script>
     <script src="player.js"></script>
   </body>
 </html>

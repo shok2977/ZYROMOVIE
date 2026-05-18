@@ -5,13 +5,54 @@ const STORAGE_KEY = "flakes_movies_data";
 // whatever tag you give. If the server returns empty VAST (no <Ad>), you get no ad on ANY tag.
 // Optional test override: player.html?key=...&adtag=ENCODED_FULL_TAG_URL
 const VAST_TAG_URL_BASE =
-  "https://exalted-engineering.com/dQm.FJzGdyGLNjvHZCGvUe/CeNme9WuIZxUpl/kTPvTBYC5bNAztY/woNoDcU_trNFjbks3uN/jwAj0QOiQK";
+  "https://exalted-engineering.com/dEmbF_z.dxGINSvhZHG/Ux/IeKmL9HuIZOU/lHkUPwTLYa5oNxzFY/wDNZDhU/tFN_j/kR3bNGjtAT0YOXQ-";
 
-// Use same-origin API in producti(on Renedr), still works locally.
 const API_BASE =
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://localhost:3001"
-    : "";
+  typeof window.ZYRO_API_BASE === "string"
+    ? window.ZYRO_API_BASE
+    : (() => {
+        const { hostname, port, protocol } = window.location;
+        if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+          return "";
+        }
+        if (protocol === "file:" || !hostname) return "http://localhost:3001";
+        if (port === "3001") return "";
+        return `http://${hostname}:3001`;
+      })();
+
+function isPlayableVideoAdUrl(url) {
+  const value = String(url || "").trim().toLowerCase();
+  if (!value.startsWith("http")) return false;
+  if (/\.(js|css|html|htm|xml|json|txt|ico|svg|woff|woff2)(\?|#|$)/i.test(value)) {
+    return false;
+  }
+  if (
+    /google\.com|gstatic\.com|googletagmanager|doubleclick|googleapis\.com\/js/i.test(
+      value
+    )
+  ) {
+    return false;
+  }
+  return (
+    /\.(mp4|webm|m3u8|mov|ogv)(\?|#|$)/i.test(value) ||
+    /\/video\//i.test(value) ||
+    /type=video/i.test(value)
+  );
+}
+
+function shouldRunPrerollAds() {
+  if (getQueryParam("noads") === "1") return false;
+  return !!String(getEffectiveVastTagBase() || "").trim();
+}
+
+function getAdPlaybackSrc(ad) {
+  const proxied = ad?.media?.playbackUrl;
+  if (proxied) {
+    const path = String(proxied).startsWith("/") ? proxied : `/${proxied}`;
+    return `${API_BASE}${path}`;
+  }
+  return ad?.media?.url || "";
+}
 
 function getEffectiveVastTagBase() {
   const raw = getQueryParam("adtag");
@@ -143,7 +184,18 @@ function computeAnimeLinearEpisode(seasons, seasonNum, episodeNum) {
 function showContent(url) {
   const box = document.getElementById("player-box");
   if (!box) return;
-  box.innerHTML = `<iframe src="${url}" allowfullscreen allow="autoplay; encrypted-media"></iframe>`;
+  const src = String(url || "").trim();
+  if (!src) return;
+  box.innerHTML = `
+    <iframe
+      src="${src.replace(/"/g, "&quot;")}"
+      title="Video player"
+      allowfullscreen
+      allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
+      referrerpolicy="no-referrer-when-downgrade"
+      loading="eager"
+    ></iframe>
+  `;
 }
 
 // Short MP4 so Video.js + contrib-ads have real content; preroll runs before this plays.
@@ -350,17 +402,16 @@ function runAdThenContent(url) {
   box.innerHTML = `
     <video
       id="ad-player"
-      class="video-js vjs-default-skin"
+      class="zyro-preroll-video"
       playsinline
+      webkit-playsinline
+      preload="auto"
       width="100%"
       height="500"
     ></video>
   `;
 
-  const vastBaseForCheck = getEffectiveVastTagBase();
-  const hasVast =
-    vastBaseForCheck && vastBaseForCheck !== "https://pubads.g.doubleclick.net/gampad/ads?sz=400x300&iu=/124319096/external/single_ad_samples&ciu_szs=300x250&impl=s&gdfp_req=1&env=vp&output=vast&unviewed_position_start=1&cust_params=deployment%3Ddevsite&correlator=";
-  if (!hasVast) {
+  if (!shouldRunPrerollAds()) {
     showContent(url);
     return;
   }
@@ -378,9 +429,18 @@ function runAdThenContent(url) {
   }
 
   let switched = false;
+  let adMaxTimer = null;
+  let adStartupFailsafeId = null;
   const safeShowContent = () => {
     if (switched) return;
     switched = true;
+    if (adMaxTimer) clearTimeout(adMaxTimer);
+    if (adStartupFailsafeId) clearTimeout(adStartupFailsafeId);
+    try {
+      videoEl.pause();
+      videoEl.removeAttribute("src");
+      videoEl.load();
+    } catch (_) {}
     showContent(url);
   };
 
@@ -423,16 +483,29 @@ function runAdThenContent(url) {
   };
 
   (async () => {
+    adStartupFailsafeId = setTimeout(() => safeShowContent(), 12000);
+    const clearAdFailsafe = () => {
+      if (adStartupFailsafeId) {
+        clearTimeout(adStartupFailsafeId);
+        adStartupFailsafeId = null;
+      }
+    };
     try {
+      const vastCtrl = new AbortController();
+      const vastTimer = setTimeout(() => vastCtrl.abort(), 10000);
       const r = await fetch(
-        `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl)
+        `${API_BASE}/api/vast/media?tag=` + encodeURIComponent(vastTagUrl),
+        { signal: vastCtrl.signal }
       );
+      clearTimeout(vastTimer);
       if (!r.ok) {
+        clearAdFailsafe();
         safeShowContent();
         return;
       }
       const ad = await r.json();
-      if (!ad?.media?.url) {
+      if (!ad?.media?.url || !isPlayableVideoAdUrl(ad.media.url)) {
+        clearAdFailsafe();
         safeShowContent();
         return;
       }
@@ -473,17 +546,41 @@ function runAdThenContent(url) {
         });
       }
 
-      videoEl.style.width = "100%";
-      videoEl.style.height = "500px";
-      videoEl.style.background = "#000";
+      const playbackSrc = getAdPlaybackSrc(ad);
+      if (!playbackSrc) {
+        safeShowContent();
+        return;
+      }
+
+      box.style.position = "relative";
+
+      const adDuration =
+        Number.isFinite(Number(ad.durationSeconds)) && Number(ad.durationSeconds) > 0
+          ? Number(ad.durationSeconds)
+          : 30;
+      const adWallStart = performance.now();
+      const adProgressSeconds = () => {
+        const videoTime = videoEl.currentTime || 0;
+        const wallTime = (performance.now() - adWallStart) / 1000;
+        if (videoEl.readyState >= 2 && videoTime > 0.2) return videoTime;
+        return Math.max(videoTime, wallTime);
+      };
+
+      const maxAdMs = Math.min((adDuration + 3) * 1000, 45000);
+      adMaxTimer = setTimeout(() => {
+        clearAdFailsafe();
+        safeShowContent();
+      }, maxAdMs);
+
       videoEl.style.cursor = ad.clickThroughUrl ? "pointer" : "default";
       videoEl.playsInline = true;
+      videoEl.setAttribute("playsinline", "");
       videoEl.muted = true;
       videoEl.autoplay = true;
       videoEl.controls = false;
-      videoEl.src = ad.media.url;
+      videoEl.preload = "auto";
+      videoEl.src = playbackSrc;
 
-      // Ensure visible clickable cursor and click target on top of video.
       let clickLayer = null;
       if (ad.clickThroughUrl) {
         clickLayer = document.createElement("button");
@@ -497,10 +594,12 @@ function runAdThenContent(url) {
         clickLayer.style.cursor = "pointer";
         clickLayer.style.padding = "0";
         clickLayer.style.margin = "0";
+        clickLayer.style.pointerEvents = "auto";
         box.appendChild(clickLayer);
       }
 
       videoEl.addEventListener("playing", () => {
+        clearAdFailsafe();
         if (impressionSent) return;
         impressionSent = true;
         pingTrackers(ad.impressionUrls || [], videoEl.currentTime || 0);
@@ -511,11 +610,11 @@ function runAdThenContent(url) {
       });
 
       videoEl.addEventListener("timeupdate", () => {
-        const ct = videoEl.currentTime || 0;
+        const ct = adProgressSeconds();
         const d =
-          Number.isFinite(Number(ad.durationSeconds)) && Number(ad.durationSeconds) > 0
-            ? Number(ad.durationSeconds)
-            : videoEl.duration || 0;
+          Number.isFinite(videoEl.duration) && videoEl.duration > 0
+            ? videoEl.duration
+            : adDuration;
         if (d > 0) {
           const p = ct / d;
           if (!q1Tracked && p >= 0.25) {
@@ -532,15 +631,17 @@ function runAdThenContent(url) {
           }
         }
 
-        if (skipBtn && !skipEnabled) {
-          const left = skipOffset - ct;
-          if (left <= 0) {
-            skipEnabled = true;
-            skipBtn.disabled = false;
-            skipBtn.textContent = "Skip Ad";
-            skipBtn.style.cursor = "pointer";
-          } else {
-            skipBtn.textContent = `Skip in ${Math.ceil(left)}s`;
+        if (skipBtn) {
+          if (!skipEnabled) {
+            const left = skipOffset - ct;
+            if (left <= 0) {
+              skipEnabled = true;
+              skipBtn.disabled = false;
+              skipBtn.textContent = "Skip Ad";
+              skipBtn.style.cursor = "pointer";
+            } else {
+              skipBtn.textContent = `Skip in ${Math.ceil(left)}s`;
+            }
           }
         }
       });
@@ -566,21 +667,33 @@ function runAdThenContent(url) {
         try {
           if (clickLayer) clickLayer.remove();
         } catch (_) {}
+        clearAdFailsafe();
         safeShowContent();
       });
       videoEl.addEventListener("error", () => {
         try {
           if (clickLayer) clickLayer.remove();
         } catch (_) {}
+        clearAdFailsafe();
         safeShowContent();
       });
 
-      try {
-        await videoEl.play();
-      } catch (_) {
-        safeShowContent();
-      }
+      let playbackStarted = false;
+      const startPlayback = async () => {
+        if (playbackStarted) return;
+        playbackStarted = true;
+        try {
+          await videoEl.play();
+        } catch (_) {
+          safeShowContent();
+        }
+      };
+
+      videoEl.addEventListener("canplay", () => startPlayback(), { once: true });
+      videoEl.load();
+      startPlayback();
     } catch (_) {
+      clearAdFailsafe();
       safeShowContent();
     }
   })();

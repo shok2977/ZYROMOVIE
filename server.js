@@ -5,6 +5,8 @@ import mongoose from "mongoose";
 import dns from "dns";
 import fs from "fs/promises";
 import path from "path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "url";
 
 const app = express();
@@ -13,9 +15,129 @@ app.use(express.json({ limit: "25mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// Serve the front-end files from the same folder as server.js
-app.use(express.static(__dirname));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+const SITE_URL = String(process.env.SITE_URL || "https://zyromovie.onrender.com").replace(
+  /\/$/,
+  ""
+);
+const TMDB_API_KEY =
+  process.env.TMDB_API_KEY || "e84730516a1d5987f96fd63d46d2f119";
+
+async function tmdbApiGet(pathAndQuery) {
+  const sep = pathAndQuery.includes("?") ? "&" : "?";
+  const url = `https://api.themoviedb.org/3${pathAndQuery}${sep}api_key=${TMDB_API_KEY}&language=en-US`;
+  const r = await fetch(url);
+  if (!r.ok) {
+    const err = new Error(`TMDB request failed (${r.status})`);
+    err.status = r.status;
+    throw err;
+  }
+  return r.json();
+}
+
+function parseTmdbIdInput(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^\d+$/.test(s)) return s;
+  const fromPath = s.match(/\/(?:movie|tv)\/(\d+)/i);
+  if (fromPath) return fromPath[1];
+  const fromQuery = s.match(/[?&]tmdb_id=(\d+)/i);
+  if (fromQuery) return fromQuery[1];
+  const digits = s.match(/(\d{5,})/);
+  if (digits) return digits[1];
+  const shortDigits = s.match(/^(\d{1,9})$/);
+  return shortDigits ? shortDigits[1] : "";
+}
+
+function tmdbMetaFromPayload(data) {
+  return {
+    title: data.title || data.name || "",
+    overview: data.overview || "",
+    posterUrl: data.poster_path
+      ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
+      : "",
+    bannerUrl: data.backdrop_path
+      ? `https://image.tmdb.org/t/p/w1280${data.backdrop_path}`
+      : "",
+  };
+}
+
+function buildTmdbTryTypes(preferredType) {
+  const tryOrder = [];
+  const push = (t) => {
+    if (t && !tryOrder.includes(t)) tryOrder.push(t);
+  };
+  push(preferredType || "movie");
+  if (preferredType === "movie" || preferredType === "animeMovie") {
+    push("tv");
+    push("anime");
+  } else {
+    push("movie");
+    push("animeMovie");
+  }
+  return tryOrder;
+}
+
+async function resolveTmdbByImdb(imdbId) {
+  const id = String(imdbId || "").trim();
+  if (!/^tt\d+$/i.test(id)) return null;
+  const found = await tmdbApiGet(
+    `/find/${encodeURIComponent(id)}?external_source=imdb_id`
+  );
+  const movie = found.movie_results?.[0];
+  if (movie?.id) {
+    return {
+      tmdbId: String(movie.id),
+      type: "movie",
+      meta: tmdbMetaFromPayload(movie),
+    };
+  }
+  const tv = found.tv_results?.[0];
+  if (tv?.id) {
+    return {
+      tmdbId: String(tv.id),
+      type: tv.genre_ids?.includes(16) ? "anime" : "tv",
+      meta: tmdbMetaFromPayload(tv),
+    };
+  }
+  return null;
+}
+
+async function resolveTmdbMeta(tmdbIdRaw, preferredType = "movie") {
+  const imdbHit = await resolveTmdbByImdb(tmdbIdRaw);
+  if (imdbHit) return imdbHit;
+
+  const tmdbId = parseTmdbIdInput(tmdbIdRaw);
+  if (!tmdbId) {
+    const err = new Error(
+      "Galat TMDB ID. Sirf number ya themoviedb.org link paste karein (jaise 550 ya /movie/550-...)."
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  const tryTypes = buildTmdbTryTypes(preferredType);
+  for (const type of tryTypes) {
+    try {
+      const path =
+        type === "movie" || type === "animeMovie"
+          ? `/movie/${tmdbId}`
+          : `/tv/${tmdbId}`;
+      const data = await tmdbApiGet(path);
+      const meta = tmdbMetaFromPayload(data);
+      if (meta.title?.trim()) {
+        return { tmdbId, type, meta };
+      }
+    } catch (_) {}
+  }
+
+  const err = new Error(
+    `TMDB par ID "${tmdbId}" nahi mila. themoviedb.org par kholo — URL se number copy karein (movie ke liye Movie, TV ke liye TV page).`
+  );
+  err.status = 404;
+  throw err;
+}
 
 // ---- Simple in-memory cache (per instance) ----
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
@@ -117,6 +239,7 @@ const bannerSchema = new mongoose.Schema({
   description: String,
   tmdbId: String,
   contentType: String,
+  movieKey: String,
   imageDataUrl: String,
   createdAt: Number,
 });
@@ -135,9 +258,11 @@ const blogSchema = new mongoose.Schema({
   slug: { type: String, unique: true, index: true },
   tmdbId: String,
   contentType: String,
+  movieKey: String,
   title: String,
   overview: String,
   description: String,
+  seoKeywords: String,
   sections: [blogSectionSchema],
   posterUrl: String,
   bannerUrl: String,
@@ -169,7 +294,369 @@ function toSlug(title, tmdbId) {
   return base ? `${base}-${tmdbId}` : `movie-${tmdbId}`;
 }
 
+function isValidVideoMediaUrl(url, mediaType) {
+  const value = String(url || "").trim().toLowerCase();
+  if (!value.startsWith("http://") && !value.startsWith("https://")) return false;
+  if (/\.(js|css|html|htm|xml|json|txt|ico|svg|woff|woff2)(\?|#|$)/i.test(value)) {
+    return false;
+  }
+  if (
+    /google\.com|gstatic\.com|googletagmanager|doubleclick|googleapis\.com\/js/i.test(
+      value
+    )
+  ) {
+    return false;
+  }
+  if (mediaType === "video/mp4" || mediaType === "video/webm") {
+    return true;
+  }
+  return (
+    /\.(mp4|webm|m3u8|mov|ogv)(\?|#|$)/i.test(value) ||
+    /\/video\//i.test(value) ||
+    /type=video/i.test(value)
+  );
+}
+
+const VAST_FETCH_MS = 15000;
+const VAST_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 ZyroMoviesVastProxy";
+
+async function fetchVastText(tagUrl) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), VAST_FETCH_MS);
+  try {
+    const r = await fetch(tagUrl, {
+      signal: ctrl.signal,
+      redirect: "follow",
+      headers: { "user-agent": VAST_UA, accept: "application/xml,text/xml,*/*" },
+    });
+    if (!r.ok) {
+      const err = new Error("failed to fetch VAST tag");
+      err.status = r.status;
+      throw err;
+    }
+    return await r.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function extractWrapperTagUri(xml) {
+  const block = xml.match(/<VASTAdTagURI[^>]*>[\s\S]*?<\/VASTAdTagURI>/i);
+  if (!block) return null;
+  const cdata = block[0].match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+  const url = String((cdata ? cdata[1] : block[0].replace(/<[^>]+>/g, "")) || "").trim();
+  return url.startsWith("http://") || url.startsWith("https://") ? url : null;
+}
+
+async function resolveVastXml(initialTag, maxHops = 6) {
+  let tagUrl = initialTag;
+  const wrapperImpressions = [];
+  let xml = "";
+
+  for (let hop = 0; hop < maxHops; hop++) {
+    xml = await fetchVastText(tagUrl);
+    const next = extractWrapperTagUri(xml);
+    if (next && /<Wrapper[\s>]/i.test(xml)) {
+      const imp =
+        xml.match(/<Impression[^>]*>[\s\S]*?<\/Impression>/gi) || [];
+      for (const block of imp) {
+        const cdata = block.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+        const url = String((cdata ? cdata[1] : "") || "").trim();
+        if (url) wrapperImpressions.push(url);
+      }
+      tagUrl = next;
+      continue;
+    }
+    return { xml, wrapperImpressions };
+  }
+
+  return { xml, wrapperImpressions };
+}
+
+function parseVastMediaPayload(xml, wrapperImpressions = []) {
+  const durationMatchH = xml.match(
+    /<Duration>\s*(\d{1,2}):(\d{2}):(\d{2})\s*<\/Duration>/
+  );
+  const durationSeconds = durationMatchH
+    ? Number(durationMatchH[1]) * 3600 +
+      Number(durationMatchH[2]) * 60 +
+      Number(durationMatchH[3])
+    : (() => {
+        const durationMatchM = xml.match(
+          /<Duration>\s*(\d{1,2}):(\d{2})\s*<\/Duration>/
+        );
+        return durationMatchM
+          ? Number(durationMatchM[1]) * 60 + Number(durationMatchM[2])
+          : null;
+      })();
+
+  const skipOffsetSeconds = (() => {
+    const m = xml.match(/<Linear[^>]*\sskipoffset="([^"]+)"[^>]*>/i);
+    if (!m) return null;
+    const raw = String(m[1] || "").trim();
+    if (!raw) return null;
+    if (raw.endsWith("%")) {
+      const pct = parseFloat(raw.slice(0, -1));
+      if (!Number.isFinite(pct) || durationSeconds == null) return null;
+      return Math.max(0, Math.floor((pct / 100) * durationSeconds));
+    }
+    const hms = raw.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
+    if (hms) {
+      return Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3]);
+    }
+    const ms = raw.match(/^(\d{1,2}):(\d{2})$/);
+    if (ms) {
+      return Number(ms[1]) * 60 + Number(ms[2]);
+    }
+    const secs = parseInt(raw, 10);
+    if (Number.isFinite(secs) && secs >= 0) return secs;
+    return null;
+  })();
+
+  const extractCdataUrls = (re) => {
+    const out = [];
+    const matches = xml.match(re) || [];
+    for (const block of matches) {
+      const cdata = block.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+      const url = String((cdata ? cdata[1] : "") || "").trim();
+      if (url) out.push(url);
+    }
+    return out;
+  };
+
+  const clickThroughUrl = (() => {
+    const m = xml.match(
+      /<ClickThrough[^>]*>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/ClickThrough>/i
+    );
+    const url = String((m && m[1]) || "").trim();
+    return url || null;
+  })();
+
+  const impressionUrls = [
+    ...wrapperImpressions,
+    ...extractCdataUrls(/<Impression[^>]*>[\s\S]*?<\/Impression>/gi),
+  ];
+  const clickTrackingUrls = extractCdataUrls(
+    /<ClickTracking[^>]*>[\s\S]*?<\/ClickTracking>/gi
+  );
+  const trackingEvents = {
+    start: extractCdataUrls(/<Tracking[^>]*event="start"[^>]*>[\s\S]*?<\/Tracking>/gi),
+    firstQuartile: extractCdataUrls(
+      /<Tracking[^>]*event="firstQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
+    ),
+    midpoint: extractCdataUrls(
+      /<Tracking[^>]*event="midpoint"[^>]*>[\s\S]*?<\/Tracking>/gi
+    ),
+    thirdQuartile: extractCdataUrls(
+      /<Tracking[^>]*event="thirdQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
+    ),
+    complete: extractCdataUrls(
+      /<Tracking[^>]*event="complete"[^>]*>[\s\S]*?<\/Tracking>/gi
+    ),
+  };
+
+  const extractMediaFile = (wantedType) => {
+    const typePattern = wantedType.replace(/\//g, "\\/");
+    const blocks = xml.match(/<MediaFile[\s\S]*?<\/MediaFile>/gi) || [];
+    const progressiveFirst = [];
+    const any = [];
+
+    for (const block of blocks) {
+      if (!new RegExp(`type=["']${typePattern}["']`, "i").test(block)) continue;
+      const cdataMatch = block.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
+      const url = String((cdataMatch ? cdataMatch[1] : block.replace(/<[^>]+>/g, "")) || "")
+        .replace(/^\s+|\s+$/g, "");
+      if (!url) continue;
+
+      const isProgressive = /delivery=["']progressive["']/i.test(block);
+      const item = { type: wantedType, url };
+      if (isProgressive) progressiveFirst.push(item);
+      else any.push(item);
+    }
+
+    if (
+      progressiveFirst.length &&
+      isValidVideoMediaUrl(progressiveFirst[0].url, wantedType)
+    ) {
+      return progressiveFirst[0];
+    }
+    if (any.length && isValidVideoMediaUrl(any[0].url, wantedType)) return any[0];
+    return null;
+  };
+
+  let media = extractMediaFile("video/mp4");
+  if (!media) media = extractMediaFile("video/webm");
+  if (media && !isValidVideoMediaUrl(media.url, media.type)) media = null;
+
+  return {
+    durationSeconds,
+    skipOffsetSeconds,
+    clickThroughUrl,
+    impressionUrls,
+    clickTrackingUrls,
+    trackingEvents,
+    media,
+  };
+}
+
+function absSiteUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) return `${SITE_URL}/img/1.jpeg`;
+  if (value.startsWith("http://") || value.startsWith("https://")) return value;
+  if (value.startsWith("/")) return `${SITE_URL}${value}`;
+  return value;
+}
+
+async function resolveMovieKey(tmdbId, contentType) {
+  const id = String(tmdbId || "").trim();
+  if (!id) return "";
+  const type = String(contentType || "").trim();
+  if (type) {
+    const directKey = `${type}-${id}`;
+    const direct = await Movie.findOne({ key: directKey }).lean();
+    if (direct) return direct.key;
+  }
+  const byTmdb = await Movie.findOne({ tmdbId: id }).lean();
+  if (byTmdb?.key) return byTmdb.key;
+  return type ? `${type}-${id}` : "";
+}
+
+function buildBlogSeoMeta(blog) {
+  const sectionText = Array.isArray(blog.sections)
+    ? blog.sections
+        .map((s) => [s.textBefore, s.textAfter].filter(Boolean).join(" "))
+        .join(" ")
+        .trim()
+    : "";
+  const focusList = String(blog.seoKeywords || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const focusPhrase = focusList[0] || blog.title || "ZyroMovies";
+  const excerpt = blog.description || sectionText || blog.overview || "";
+  const pageTitle = `${blog.title} Watch Online | ${focusPhrase} | ZyroMovies`;
+  const pageDescription = `Watch ${blog.title} online free on ZyroMovies (Zyro Movies). ${excerpt}`.slice(
+    0,
+    165
+  );
+  const keywords = [
+    "zyro movies",
+    "zyromovies",
+    "ZyroMovies",
+    "zyro movie",
+    "watch online",
+    "watch free",
+    blog.title,
+    ...focusList,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  const image = absSiteUrl(
+    blog.bannerUrl || blog.posterUrl || `${SITE_URL}/img/1.jpeg`
+  );
+  return { pageTitle, pageDescription, keywords, image, focusPhrase, excerpt };
+}
+
+function renderBlogSectionsHtml(blog) {
+  const sections = Array.isArray(blog.sections) ? blog.sections : [];
+  return sections
+    .map((section, index) => {
+      const textBefore = String(section?.textBefore || "").trim();
+      const textAfter = String(section?.textAfter || "").trim();
+      const imageSrc = absSiteUrl(section?.imageDataUrl || section?.imageUrl || "");
+      const kind = section?.imageKind === "banner" ? "banner" : "photo";
+      if (!textBefore && !textAfter && !imageSrc) return "";
+
+      let html = `<section class="blog-content-block"><h2 class="blog-block-label">Section ${index + 1}</h2>`;
+      if (textBefore) {
+        html += `<div class="blog-text-block"><span class="blog-text-block-label">Text before image</span><p class="blog-detail-text">${escapeHtml(textBefore)}</p></div>`;
+      }
+      if (section?.imageDataUrl || section?.imageUrl) {
+        html += `<figure class="blog-figure blog-figure--${kind}"><img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(blog.title || "Blog")}" loading="lazy" /></figure>`;
+      }
+      if (textAfter) {
+        html += `<div class="blog-text-block"><span class="blog-text-block-label">Text after image</span><p class="blog-detail-text">${escapeHtml(textAfter)}</p></div>`;
+      }
+      html += `</section>`;
+      return html;
+    })
+    .join("");
+}
+
 // ---- API ----
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    ok: true,
+    db: mongoose.connection.readyState === 1,
+  });
+});
+
+app.get("/api/tmdb/resolve", async (req, res) => {
+  try {
+    const out = await resolveTmdbMeta(
+      req.query.tmdbId,
+      String(req.query.type || "movie")
+    );
+    res.json(out);
+  } catch (e) {
+    res.status(e?.status === 404 ? 404 : e?.status === 400 ? 400 : 502).json({
+      error: e?.message || "TMDB lookup failed",
+    });
+  }
+});
+
+app.get("/api/tmdb/details", async (req, res) => {
+  const tmdbId = parseTmdbIdInput(req.query.tmdbId);
+  const type = String(req.query.type || "movie").trim();
+  if (!tmdbId) {
+    res.status(400).json({ error: "tmdbId is required" });
+    return;
+  }
+  try {
+    const path =
+      type === "movie" || type === "animeMovie"
+        ? `/movie/${tmdbId}`
+        : `/tv/${tmdbId}`;
+    const data = await tmdbApiGet(path);
+    res.json(tmdbMetaFromPayload(data));
+  } catch (e) {
+    res.status(e?.status === 404 ? 404 : 502).json({
+      error: e?.message || "TMDB lookup failed",
+    });
+  }
+});
+
+app.get("/api/tmdb/seasons", async (req, res) => {
+  const tmdbId = parseTmdbIdInput(req.query.tmdbId);
+  const maxRaw = parseInt(String(req.query.max || "3"), 10);
+  const maxSeasons = Number.isFinite(maxRaw)
+    ? Math.max(1, Math.min(maxRaw, 10))
+    : 3;
+  if (!tmdbId) {
+    res.status(400).json({ error: "tmdbId is required" });
+    return;
+  }
+  try {
+    const tv = await tmdbApiGet(`/tv/${tmdbId}`);
+    const total = Math.min(tv.number_of_seasons || 0, maxSeasons);
+    const seasons = [];
+    for (let s = 1; s <= total; s++) {
+      try {
+        const seasonData = await tmdbApiGet(`/tv/${tmdbId}/season/${s}`);
+        const episodes = (seasonData.episodes || []).map((ep) => ({
+          episode_number: ep.episode_number,
+          name: ep.name || `Episode ${ep.episode_number}`,
+        }));
+        seasons.push({ season_number: s, episodes });
+      } catch (_) {}
+    }
+    res.json(seasons);
+  } catch (e) {
+    res.status(502).json({ error: e?.message || "TMDB seasons failed" });
+  }
+});
 
 // All data for front-end (movies by key, lists by name, banners array)
 app.get("/api/data", async (req, res) => {
@@ -222,7 +709,20 @@ app.get("/api/data", async (req, res) => {
   );
   const listOrder = lists.map((l) => l.name);
 
-  res.json({ movies: moviesByKey, lists: listsByName, listOrder, banners });
+  const bannersWithKeys = banners.map((b) => {
+    const lean = { ...b, id: b._id?.toString?.() || b.id };
+    if (!lean.movieKey && lean.tmdbId && lean.contentType) {
+      lean.movieKey = `${lean.contentType}-${lean.tmdbId}`;
+    }
+    return lean;
+  });
+
+  res.json({
+    movies: moviesByKey,
+    lists: listsByName,
+    listOrder,
+    banners: bannersWithKeys,
+  });
 });
 
 app.get("/api/blogs", async (req, res) => {
@@ -264,162 +764,87 @@ app.get("/api/vast/media", async (req, res) => {
       return;
     }
 
-    const r = await fetch(tag, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastProxy",
-      },
-    });
-    if (!r.ok) {
-      res
-        .status(502)
-        .json({ error: "failed to fetch VAST tag", status: r.status });
-      return;
+    const { xml, wrapperImpressions } = await resolveVastXml(tag);
+    const out = parseVastMediaPayload(xml, wrapperImpressions);
+    if (out.media?.url) {
+      out.media.playbackUrl =
+        "/api/vast/stream?u=" + encodeURIComponent(out.media.url);
     }
-
-    const xml = await r.text();
-
-    // Duration: prefer HH:MM:SS; fallback to MM:SS.
-    const durationMatchH = xml.match(
-      /<Duration>\s*(\d{1,2}):(\d{2}):(\d{2})\s*<\/Duration>/
-    );
-    const durationSeconds = durationMatchH
-      ? Number(durationMatchH[1]) * 3600 +
-        Number(durationMatchH[2]) * 60 +
-        Number(durationMatchH[3])
-      : (() => {
-          const durationMatchM = xml.match(
-            /<Duration>\s*(\d{1,2}):(\d{2})\s*<\/Duration>/
-          );
-          return durationMatchM
-            ? Number(durationMatchM[1]) * 60 + Number(durationMatchM[2])
-            : null;
-        })();
-
-    // Skip offset (VAST Linear skipoffset="HH:MM:SS" or "MM:SS" or "15%" or "15").
-    // We'll expose seconds when determinable; otherwise null.
-    const skipOffsetSeconds = (() => {
-      const m = xml.match(/<Linear[^>]*\sskipoffset="([^"]+)"[^>]*>/i);
-      if (!m) return null;
-      const raw = String(m[1] || "").trim();
-      if (!raw) return null;
-      if (raw.endsWith("%")) {
-        const pct = parseFloat(raw.slice(0, -1));
-        if (!Number.isFinite(pct) || durationSeconds == null) return null;
-        return Math.max(0, Math.floor((pct / 100) * durationSeconds));
-      }
-      // HH:MM:SS or MM:SS
-      const hms = raw.match(/^(\d{1,2}):(\d{2}):(\d{2})$/);
-      if (hms) {
-        return Number(hms[1]) * 3600 + Number(hms[2]) * 60 + Number(hms[3]);
-      }
-      const ms = raw.match(/^(\d{1,2}):(\d{2})$/);
-      if (ms) {
-        return Number(ms[1]) * 60 + Number(ms[2]);
-      }
-      // plain seconds
-      const secs = parseInt(raw, 10);
-      if (Number.isFinite(secs) && secs >= 0) return secs;
-      return null;
-    })();
-
-    const extractCdataUrls = (re) => {
-      const out = [];
-      const matches = xml.match(re) || [];
-      for (const block of matches) {
-        const cdata = block.match(/<!\[CDATA\[([\s\S]*?)\]\]>/i);
-        const url = String((cdata ? cdata[1] : "") || "").trim();
-        if (url) out.push(url);
-      }
-      return out;
-    };
-
-    // ClickThrough URL (open in new tab on user click)
-    const clickThroughUrl = (() => {
-      const m = xml.match(
-        /<ClickThrough[^>]*>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/ClickThrough>/i
-      );
-      const url = String((m && m[1]) || "").trim();
-      return url || null;
-    })();
-
-    // Trackers (we'll ping these server-side to avoid CORS issues)
-    const impressionUrls = extractCdataUrls(/<Impression[^>]*>[\s\S]*?<\/Impression>/gi);
-    const clickTrackingUrls = extractCdataUrls(
-      /<ClickTracking[^>]*>[\s\S]*?<\/ClickTracking>/gi
-    );
-    const trackingEvents = {
-      start: extractCdataUrls(/<Tracking[^>]*event="start"[^>]*>[\s\S]*?<\/Tracking>/gi),
-      firstQuartile: extractCdataUrls(
-        /<Tracking[^>]*event="firstQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
-      ),
-      midpoint: extractCdataUrls(
-        /<Tracking[^>]*event="midpoint"[^>]*>[\s\S]*?<\/Tracking>/gi
-      ),
-      thirdQuartile: extractCdataUrls(
-        /<Tracking[^>]*event="thirdQuartile"[^>]*>[\s\S]*?<\/Tracking>/gi
-      ),
-      complete: extractCdataUrls(
-        /<Tracking[^>]*event="complete"[^>]*>[\s\S]*?<\/Tracking>/gi
-      ),
-    };
-
-    const escType = (t) => t.replace(/\//g, "\\/");
-
-    // VAST MediaFile URLs usually live inside CDATA. Regex match can be fragile
-    // across VAST variants, so we extract all <MediaFile> blocks for a given type
-    // then pick the first progressive (delivery="progressive") else fallback first.
-    const extractMediaFile = (wantedType) => {
-      const typeEsc = escType(wantedType);
-
-      const reMediaFile = new RegExp(
-        `<MediaFile[^>]*type="${typeEsc}"[^>]*>[\\s\\S]*?<\\/MediaFile>`,
-        "gi"
-      );
-
-      const progressiveFirst = [];
-      const any = [];
-
-      const blocks = xml.match(reMediaFile) || [];
-      for (const block of blocks) {
-        // Extract CDATA content if present
-        const cdataMatch = block.match(
-          /<!\[CDATA\[([\s\S]*?)\]\]>/i
-        );
-        const url = (cdataMatch ? cdataMatch[1] : "")
-          .replace(/^\s+|\s+$/g, "");
-        if (!url) continue;
-
-        const isProgressive = /delivery="progressive"/i.test(block);
-        const item = { type: wantedType, url };
-        if (isProgressive) progressiveFirst.push(item);
-        else any.push(item);
-      }
-
-      if (progressiveFirst.length) return progressiveFirst[0];
-      if (any.length) return any[0];
-      return null;
-    };
-
-    let media = extractMediaFile("video/mp4");
-    if (!media) media = extractMediaFile("video/webm");
-
-    const out = {
-      durationSeconds,
-      skipOffsetSeconds,
-      clickThroughUrl,
-      impressionUrls,
-      clickTrackingUrls,
-      trackingEvents,
-      media,
-    };
     res.json(out);
     _cacheSet(cacheKey, out);
   } catch (e) {
+    if (e?.status) {
+      res.status(502).json({ error: "failed to fetch VAST tag", status: e.status });
+      return;
+    }
     res.status(500).json({
       error: "VAST parsing failed",
       message: e?.message ?? String(e),
     });
+  }
+});
+
+// Proxy preroll MP4 through our server (referrer / hotlink blocks break direct <video src>).
+app.get("/api/vast/stream", async (req, res) => {
+  const u = req.query.u;
+  if (!u || typeof u !== "string") {
+    res.status(400).end();
+    return;
+  }
+  if (!isValidVideoMediaUrl(u)) {
+    res.status(400).end();
+    return;
+  }
+
+  let referer = `${SITE_URL}/`;
+  try {
+    referer = new URL(u).origin + "/";
+  } catch (_) {}
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  try {
+    const headers = {
+      "user-agent": VAST_UA,
+      referer,
+      accept: "video/mp4,video/webm,video/*,*/*",
+    };
+    if (req.headers.range) headers.range = req.headers.range;
+
+    const r = await fetch(u, {
+      signal: ctrl.signal,
+      headers,
+      redirect: "follow",
+    });
+    if (!r.ok) {
+      res.status(r.status === 404 ? 404 : 502).end();
+      return;
+    }
+
+    res.status(r.status);
+    for (const name of [
+      "content-type",
+      "content-length",
+      "content-range",
+      "accept-ranges",
+    ]) {
+      const v = r.headers.get(name);
+      if (v) res.setHeader(name, v);
+    }
+    if (!res.getHeader("content-type")) {
+      res.setHeader("content-type", "video/mp4");
+    }
+    res.setHeader("cache-control", "private, max-age=120");
+
+    if (r.body) {
+      await pipeline(Readable.fromWeb(r.body), res);
+    } else {
+      res.end();
+    }
+  } catch (_) {
+    if (!res.headersSent) res.status(502).end();
+  } finally {
+    clearTimeout(timer);
   }
 });
 
@@ -467,8 +892,7 @@ app.get("/api/vast/proxy", async (req, res) => {
 
     const r = await fetch(tag, {
       headers: {
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastProxy",
+        "user-agent": VAST_UA,
         accept: "application/xml,text/xml,*/*",
       },
       redirect: "follow",
@@ -508,20 +932,11 @@ app.get("/api/vast/debug", async (req, res) => {
       return;
     }
 
-    const r = await fetch(tag, {
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZyroMoviesVastProxy",
-        accept: "application/xml,text/xml,*/*",
-      },
-      redirect: "follow",
-    });
-    const ct = r.headers.get("content-type") || "";
-    const body = await r.text();
+    const body = await fetchVastText(tag);
     const out = {
-      ok: r.ok,
-      status: r.status,
-      contentType: ct,
+      ok: true,
+      status: 200,
+      contentType: "application/xml",
       snippet: body.slice(0, 800),
     };
     res.json(out);
@@ -536,12 +951,29 @@ app.get("/api/vast/debug", async (req, res) => {
 
 // Create / update movie (used by admin Add + Edit)
 app.post("/api/movie", async (req, res) => {
-  const movie = await Movie.findOneAndUpdate(
-    { key: req.body.key },
-    req.body,
-    { upsert: true, new: true }
-  );
-  res.json(movie);
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+    });
+    return;
+  }
+  if (!req.body?.key) {
+    res.status(400).json({ error: "Movie key is required." });
+    return;
+  }
+  try {
+    const movie = await Movie.findOneAndUpdate(
+      { key: req.body.key },
+      req.body,
+      { upsert: true, returnDocument: "after" }
+    );
+    res.json(movie);
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to save movie",
+      message: e?.message ?? String(e),
+    });
+  }
 });
 
 // Delete movie
@@ -554,6 +986,12 @@ app.delete("/api/movie/:key", async (req, res) => {
 
 // Create list (if not exists)
 app.post("/api/list", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+    });
+    return;
+  }
   const { name } = req.body;
   const existing = await List.findOne({ name });
   if (existing) {
@@ -589,18 +1027,39 @@ app.post("/api/lists/reorder", async (req, res) => {
 
 // Assign movie to list
 app.post("/api/list/assign", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+    });
+    return;
+  }
   const { name, key } = req.body;
-  const list = await List.findOneAndUpdate(
-    { name },
-    { $addToSet: { movieKeys: key } },
-    { upsert: true, new: true }
-  );
-  res.json(list);
+  if (!name || !key) {
+    res.status(400).json({ error: "name and key are required" });
+    return;
+  }
+  try {
+    const list = await List.findOneAndUpdate(
+      { name },
+      { $addToSet: { movieKeys: key } },
+      { upsert: true, returnDocument: "after" }
+    );
+    res.json(list);
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to assign movie to list",
+      message: e?.message ?? String(e),
+    });
+  }
 });
 
 // Add banner
 app.post("/api/banner", async (req, res) => {
-  const banner = await Banner.create(req.body);
+  const payload = { ...req.body };
+  if (payload.tmdbId) {
+    payload.movieKey = await resolveMovieKey(payload.tmdbId, payload.contentType);
+  }
+  const banner = await Banner.create(payload);
   res.json(banner);
 });
 
@@ -660,15 +1119,19 @@ app.post("/api/blog", async (req, res) => {
         }))
       : [];
 
+    const movieKey = await resolveMovieKey(payload.tmdbId, payload.contentType);
+
     const blog = await Blog.findOneAndUpdate(
       { slug },
       {
         slug,
         tmdbId: String(payload.tmdbId),
         contentType: String(payload.contentType || "movie"),
+        movieKey,
         title: String(payload.title),
         overview: String(payload.overview || ""),
         description: String(payload.description || ""),
+        seoKeywords: String(payload.seoKeywords || ""),
         sections,
         posterUrl: String(payload.posterUrl || ""),
         bannerUrl: String(payload.bannerUrl || ""),
@@ -700,6 +1163,44 @@ app.get("/blog", (req, res) => {
   res.sendFile(path.join(__dirname, "blog.html"));
 });
 
+app.get("/sitemap.xml", async (req, res) => {
+  const urls = [
+    { loc: `${SITE_URL}/`, changefreq: "daily", priority: "1.0" },
+    { loc: `${SITE_URL}/blog`, changefreq: "daily", priority: "0.9" },
+    { loc: `${SITE_URL}/blog.html`, changefreq: "daily", priority: "0.85" },
+  ];
+
+  if (mongoose.connection.readyState === 1) {
+    const blogs = await Blog.find().select("slug updatedAt").lean();
+    blogs.forEach((blog) => {
+      urls.push({
+        loc: `${SITE_URL}/blog/${encodeURIComponent(blog.slug)}`,
+        changefreq: "weekly",
+        priority: "0.88",
+        lastmod: new Date(blog.updatedAt || Date.now()).toISOString().split("T")[0],
+      });
+    });
+  }
+
+  const body = urls
+    .map((entry) => {
+      const lastmod = entry.lastmod
+        ? `\n    <lastmod>${entry.lastmod}</lastmod>`
+        : "";
+      return `  <url>
+    <loc>${escapeHtml(entry.loc)}</loc>${lastmod}
+    <changefreq>${entry.changefreq}</changefreq>
+    <priority>${entry.priority}</priority>
+  </url>`;
+    })
+    .join("\n");
+
+  res.type("application/xml");
+  res.send(
+    `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${body}\n</urlset>`
+  );
+});
+
 app.get("/blog/:slug", async (req, res) => {
   if (mongoose.connection.readyState !== 1) {
     res.sendFile(path.join(__dirname, "blog.html"));
@@ -712,41 +1213,60 @@ app.get("/blog/:slug", async (req, res) => {
     return;
   }
 
-  const canonical = `https://zyromovie.onrender.com/blog/${encodeURIComponent(
-    blog.slug
-  )}`;
-  const pageTitle = `${blog.title} Movie Review & Story | ZyroMovies Blog`;
-  const sectionText = Array.isArray(blog.sections)
-    ? blog.sections
-        .map((s) => [s.textBefore, s.textAfter].filter(Boolean).join(" "))
-        .join(" ")
-        .trim()
-    : "";
-  const pageDescription =
-    blog.description || sectionText || blog.overview || `${blog.title} blog`;
-  const image = blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
-  const jsonLd = {
-    "@context": "https://schema.org",
-    "@type": "BlogPosting",
-    headline: blog.title,
-    description: pageDescription,
-    image: [image],
-    datePublished: new Date(blog.createdAt || Date.now()).toISOString(),
-    dateModified: new Date(blog.updatedAt || blog.createdAt || Date.now()).toISOString(),
-    mainEntityOfPage: canonical,
-    author: { "@type": "Organization", name: "ZyroMovies" },
-    publisher: { "@type": "Organization", name: "ZyroMovies" },
-  };
+  const canonical = `${SITE_URL}/blog/${encodeURIComponent(blog.slug)}`;
+  const { pageTitle, pageDescription, keywords, image } = buildBlogSeoMeta(blog);
+  const movieKey =
+    blog.movieKey || (await resolveMovieKey(blog.tmdbId, blog.contentType));
+  const playHref = movieKey
+    ? `/player.html?key=${encodeURIComponent(movieKey)}`
+    : "/";
+  const sectionsHtml = renderBlogSectionsHtml(blog);
+  const intro = String(blog.description || "").trim();
+
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "BlogPosting",
+      headline: blog.title,
+      description: pageDescription,
+      image: [image],
+      keywords,
+      datePublished: new Date(blog.createdAt || Date.now()).toISOString(),
+      dateModified: new Date(blog.updatedAt || blog.createdAt || Date.now()).toISOString(),
+      mainEntityOfPage: canonical,
+      author: { "@type": "Organization", name: "ZyroMovies" },
+      publisher: {
+        "@type": "Organization",
+        name: "ZyroMovies",
+        url: SITE_URL,
+      },
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "Movie",
+      name: blog.title,
+      description: pageDescription,
+      image,
+      url: canonical,
+      potentialAction: {
+        "@type": "WatchAction",
+        target: `${SITE_URL}${playHref}`,
+      },
+    },
+  ];
 
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="index, follow, max-image-preview:large" />
+  <meta name="theme-color" content="#151515" />
   <title>${escapeHtml(pageTitle)}</title>
   <meta name="description" content="${escapeHtml(pageDescription)}" />
-  <meta name="robots" content="index,follow" />
+  <meta name="keywords" content="${escapeHtml(keywords)}" />
   <link rel="canonical" href="${escapeHtml(canonical)}" />
+  <meta property="og:site_name" content="ZyroMovies" />
   <meta property="og:type" content="article" />
   <meta property="og:title" content="${escapeHtml(pageTitle)}" />
   <meta property="og:description" content="${escapeHtml(pageDescription)}" />
@@ -756,23 +1276,41 @@ app.get("/blog/:slug", async (req, res) => {
   <meta name="twitter:title" content="${escapeHtml(pageTitle)}" />
   <meta name="twitter:description" content="${escapeHtml(pageDescription)}" />
   <meta name="twitter:image" content="${escapeHtml(image)}" />
+  <link rel="stylesheet" href="/style.css" />
   <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
-  <script>window.location.replace("/blog.html?slug=${encodeURIComponent(
-    blog.slug
-  )}");</script>
 </head>
 <body>
-  <noscript>
-    <h1>${escapeHtml(blog.title)}</h1>
-    <img src="${escapeHtml(image)}" alt="${escapeHtml(blog.title)}" style="max-width:100%;height:auto;" />
-    <p>${escapeHtml(pageDescription)}</p>
-    <p><a href="/blog.html?slug=${encodeURIComponent(blog.slug)}">Open blog</a></p>
-  </noscript>
+  <div class="navbar">
+    <div class="navbar-container">
+      <div class="logo-container">
+        <h1 class="logo"><a href="/index.html" style="color:inherit;text-decoration:none;">ZyroMovies</a></h1>
+      </div>
+      <div class="blog-nav-links">
+        <a href="/index.html" class="site-blog-link">Home</a>
+        <a href="/blog.html" class="site-blog-link">BLOG</a>
+      </div>
+    </div>
+  </div>
+  <main class="container">
+    <article class="content-container blog-seo-article">
+      <a href="/blog.html" class="admin-back-link">&larr; All blogs</a>
+      <h1 class="movie-list-title">${escapeHtml(blog.title)}</h1>
+      <p class="blog-seo-lead">${escapeHtml(pageDescription)}</p>
+      <a class="blog-play-btn" href="${escapeHtml(playHref)}">&#9654; Watch ${escapeHtml(blog.title)} Online</a>
+      ${intro ? `<div class="blog-detail-intro-wrap"><h2 class="blog-block-label">Intro</h2><p class="blog-detail-description">${escapeHtml(intro)}</p></div>` : ""}
+      <div class="blog-detail-sections">${sectionsHtml}</div>
+    </article>
+  </main>
+  <footer class="site-footer-nav">
+    <a href="/blog.html" class="site-blog-link">BLOG</a>
+  </footer>
 </body>
 </html>`;
 
   res.send(html);
 });
+
+app.use(express.static(__dirname));
 
 app.listen(PORT, () => {
   console.log("API running on http://localhost:" + PORT);

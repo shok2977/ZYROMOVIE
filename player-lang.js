@@ -2,9 +2,17 @@ const STORAGE_KEY = "flakes_movies_data";
 
 // Use same-origin API in production (Render), still works locally.
 const API_BASE =
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://localhost:3001"
-    : "";
+  typeof window.ZYRO_API_BASE === "string"
+    ? window.ZYRO_API_BASE
+    : (() => {
+        const { hostname, port, protocol } = window.location;
+        if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+          return "";
+        }
+        if (protocol === "file:" || !hostname) return "http://localhost:3001";
+        if (port === "3001") return "";
+        return `http://${hostname}:3001`;
+      })();
 
 async function fetchAllData() {
   const res = await fetch(`${API_BASE}/api/data`);

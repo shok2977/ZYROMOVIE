@@ -1,7 +1,21 @@
 const API_BASE =
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://localhost:3001"
-    : "";
+  typeof window.ZYRO_API_BASE === "string"
+    ? window.ZYRO_API_BASE
+    : (() => {
+        const { hostname, port, protocol } = window.location;
+        if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+          return "";
+        }
+        if (protocol === "file:" || !hostname) return "http://localhost:3001";
+        if (port === "3001") return "";
+        return `http://${hostname}:3001`;
+      })();
+
+const SITE_URL =
+  window.location.hostname === "localhost" ||
+  window.location.hostname === "127.0.0.1"
+    ? window.location.origin
+    : "https://zyromovie.onrender.com";
 
 async function fetchBlogs() {
   const res = await fetch(`${API_BASE}/api/blogs`);
@@ -15,6 +29,12 @@ async function fetchBlogBySlug(slug) {
   return await res.json();
 }
 
+async function fetchSiteData() {
+  const res = await fetch(`${API_BASE}/api/data`);
+  if (!res.ok) throw new Error("Failed to load site data");
+  return await res.json();
+}
+
 function getBlogExcerpt(blog) {
   if (blog?.description) return blog.description;
   const sections = Array.isArray(blog?.sections) ? blog.sections : [];
@@ -25,6 +45,32 @@ function getBlogExcerpt(blog) {
   return blog?.overview || "";
 }
 
+function buildBlogSeoMeta(blog) {
+  const focusList = String(blog?.seoKeywords || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const focusPhrase = focusList[0] || blog?.title || "ZyroMovies";
+  const excerpt = getBlogExcerpt(blog);
+  const pageTitle = `${blog.title} Watch Online | ${focusPhrase} | ZyroMovies`;
+  const pageDescription = `Watch ${blog.title} online free on ZyroMovies (Zyro Movies). ${excerpt}`.slice(
+    0,
+    165
+  );
+  const keywords = [
+    "zyro movies",
+    "zyromovies",
+    "ZyroMovies",
+    "zyro movie",
+    "watch online",
+    blog.title,
+    ...focusList,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return { pageTitle, pageDescription, keywords, focusPhrase };
+}
+
 function normalizeImageKind(kind) {
   return String(kind || "").toLowerCase() === "banner" ? "banner" : "photo";
 }
@@ -32,34 +78,82 @@ function normalizeImageKind(kind) {
 function resolveBlogImageUrl(url) {
   const value = String(url || "").trim();
   if (!value) return "";
-  if (
-    value.startsWith("data:") ||
-    value.startsWith("http://") ||
-    value.startsWith("https://")
-  ) {
-    return value;
-  }
-  if (value.startsWith("/")) {
-    return `${API_BASE}${value}`;
-  }
-  return value;
+  if (value.startsWith("data:")) return value;
+  if (value.startsWith("http://") || value.startsWith("https://")) return value;
+  const path = value.startsWith("/") ? value : `/${value}`;
+  return API_BASE ? `${API_BASE}${path}` : path;
 }
 
 function getBlogSeoImage(blog) {
   const sections = Array.isArray(blog?.sections) ? blog.sections : [];
   for (const section of sections) {
-    if (section?.imageDataUrl) return section.imageDataUrl;
+    if (section?.imageDataUrl) return resolveBlogImageUrl(section.imageDataUrl);
   }
-  return blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
+  return blog.bannerUrl || blog.posterUrl || `${SITE_URL}/img/1.jpeg`;
+}
+
+function buildPlayerUrl(movie, movieKey) {
+  if (
+    movie?.sourceKind === "download" &&
+    (movie.type === "tv" || movie.type === "anime") &&
+    Array.isArray(movie.seasons) &&
+    movie.seasons.length
+  ) {
+    const firstSeason = movie.seasons[0];
+    const firstEp =
+      (firstSeason.episodes &&
+        firstSeason.episodes[0] &&
+        firstSeason.episodes[0].episode_number) ||
+      1;
+    const url = new URL("player-lang.html", window.location.href);
+    url.searchParams.set("key", movieKey);
+    url.searchParams.set("season", String(firstSeason.season_number));
+    url.searchParams.set("episode", String(firstEp));
+    url.searchParams.set("lang", "0");
+    return url.toString();
+  }
+
+  if (
+    movie?.sourceKind === "download" &&
+    (movie.type === "movie" || movie.type === "animeMovie")
+  ) {
+    const url = new URL("player-lang.html", window.location.href);
+    url.searchParams.set("key", movieKey);
+    url.searchParams.set("lang", "0");
+    return url.toString();
+  }
+
+  return `player.html?key=${encodeURIComponent(movieKey)}`;
+}
+
+async function resolvePlayUrl(blog) {
+  const movies = (await fetchSiteData()).movies || {};
+  const preferredKey =
+    blog.movieKey || `${blog.contentType || "movie"}-${blog.tmdbId}`;
+
+  if (movies[preferredKey]) {
+    return buildPlayerUrl(movies[preferredKey], preferredKey);
+  }
+
+  for (const [key, movie] of Object.entries(movies)) {
+    if (movie && String(movie.tmdbId) === String(blog.tmdbId)) {
+      return buildPlayerUrl(movie, key);
+    }
+  }
+
+  if (preferredKey && blog.tmdbId) {
+    return `player.html?key=${encodeURIComponent(preferredKey)}`;
+  }
+
+  return "";
 }
 
 function updateSeoForDetail(blog) {
-  const title = `${blog.title} Movie Review & Story | ZyroMovies Blog`;
-  const description = getBlogExcerpt(blog) || `${blog.title} blog`;
+  const { pageTitle, pageDescription, keywords } = buildBlogSeoMeta(blog);
   const image = getBlogSeoImage(blog);
-  const canonical = `${window.location.origin}/blog/${encodeURIComponent(blog.slug)}`;
+  const canonical = `${SITE_URL}/blog/${encodeURIComponent(blog.slug)}`;
 
-  document.title = title;
+  document.title = pageTitle;
 
   const upsertMeta = (selector, attr, value) => {
     let el = document.querySelector(selector);
@@ -77,13 +171,15 @@ function updateSeoForDetail(blog) {
     el.setAttribute(attr, value);
   };
 
-  upsertMeta('meta[name="description"]', "content", description);
-  upsertMeta('meta[property="og:title"]', "content", title);
-  upsertMeta('meta[property="og:description"]', "content", description);
+  upsertMeta('meta[name="description"]', "content", pageDescription);
+  upsertMeta('meta[name="keywords"]', "content", keywords);
+  upsertMeta('meta[property="og:title"]', "content", pageTitle);
+  upsertMeta('meta[property="og:description"]', "content", pageDescription);
   upsertMeta('meta[property="og:image"]', "content", image);
   upsertMeta('meta[property="og:url"]', "content", canonical);
-  upsertMeta('meta[name="twitter:title"]', "content", title);
-  upsertMeta('meta[name="twitter:description"]', "content", description);
+  upsertMeta('meta[property="og:type"]', "content", "article");
+  upsertMeta('meta[name="twitter:title"]', "content", pageTitle);
+  upsertMeta('meta[name="twitter:description"]', "content", pageDescription);
   upsertMeta('meta[name="twitter:image"]', "content", image);
 
   let link = document.querySelector('link[rel="canonical"]');
@@ -108,7 +204,7 @@ function renderBlogList(blogs) {
   blogs.forEach((blog) => {
     const card = document.createElement("a");
     card.className = "blog-card";
-    card.href = `blog.html?slug=${encodeURIComponent(blog.slug)}`;
+    card.href = `/blog/${encodeURIComponent(blog.slug)}`;
     const excerpt = getBlogExcerpt(blog).slice(0, 180);
     card.innerHTML = `
       <img class="blog-card-image" src="${blog.bannerUrl || blog.posterUrl || "img/1.jpeg"}" alt="${blog.title || "Blog"}" />
@@ -168,7 +264,12 @@ function renderBlogSections(blog) {
       img.src = imageSrc;
       img.alt = `${blog.title || "Blog"} - ${kind}`;
       img.loading = "lazy";
+      img.decoding = "async";
       img.referrerPolicy = "no-referrer";
+      img.onerror = () => {
+        img.style.outline = "2px solid #ff6b6b";
+        img.alt = "Image failed to load";
+      };
       figure.appendChild(img);
       block.appendChild(figure);
     }
@@ -191,6 +292,22 @@ function renderBlogSections(blog) {
   });
 }
 
+async function setupPlayButton(blog) {
+  const wrap = document.getElementById("blog-play-wrap");
+  const btn = document.getElementById("blog-play-btn");
+  if (!wrap || !btn) return;
+
+  const playUrl = await resolvePlayUrl(blog);
+  if (!playUrl) {
+    wrap.style.display = "none";
+    return;
+  }
+
+  btn.href = playUrl;
+  btn.textContent = `▶ Watch ${blog.title || "Now"} Online`;
+  wrap.style.display = "block";
+}
+
 function renderBlogDetail(blog) {
   const listView = document.getElementById("blog-list-view");
   const detailView = document.getElementById("blog-detail-view");
@@ -210,6 +327,7 @@ function renderBlogDetail(blog) {
 
   renderBlogSections(blog);
   updateSeoForDetail(blog);
+  setupPlayButton(blog);
 }
 
 document.addEventListener("DOMContentLoaded", async () => {

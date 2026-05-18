@@ -1,10 +1,17 @@
 // UTILITIES FOR MOVIE STORAGE
 
-// Use same-origin API in production (Render), still works locally.
 const API_BASE =
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://localhost:3001"
-    : "";
+  typeof window.ZYRO_API_BASE === "string"
+    ? window.ZYRO_API_BASE
+    : (() => {
+        const { hostname, port, protocol } = window.location;
+        if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+          return "";
+        }
+        if (protocol === "file:" || !hostname) return "http://localhost:3001";
+        if (port === "3001") return "";
+        return `http://${hostname}:3001`;
+      })();
 
 async function fetchAllData() {
   const res = await fetch(`${API_BASE}/api/data`);
@@ -34,17 +41,27 @@ function loadMovieDataLocal() {
 async function fetchAllDataPreferApi() {
   try {
     const data = await fetchAllData();
-    if (
-      data &&
-      data.movies &&
-      Object.keys(data.movies).length > 0 &&
-      data.lists
-    ) {
-      return data;
+    if (data?.movies && Object.keys(data.movies).length > 0) {
+      return {
+        movies: data.movies,
+        lists: data.lists || {},
+        banners: data.banners || [],
+        listOrder: Array.isArray(data.listOrder) ? data.listOrder : [],
+      };
     }
-    return loadMovieDataLocal();
+  } catch (err) {
+    console.warn("API unavailable:", err);
+  }
+
+  const local = loadMovieDataLocal();
+  if (local?.movies && Object.keys(local.movies).length > 0) {
+    return local;
+  }
+
+  try {
+    return await fetchAllData();
   } catch (_) {
-    return loadMovieDataLocal();
+    return { movies: {}, lists: {}, banners: [], listOrder: [] };
   }
 }
 
@@ -145,23 +162,12 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
     img.src = movie.posterUrl || "img/1.jpeg";
     img.alt = movie.title || "";
 
-    const title = document.createElement("span");
-    title.className = "movie-list-item-title";
-    title.textContent = movie.title || "Untitled";
-
-    const desc = document.createElement("p");
-    desc.className = "movie-list-item-desc";
-    desc.textContent =
-      movie.overview || "No description available for this title yet.";
-
-    const btn = document.createElement("button");
-    btn.className = "movie-list-item-button";
-    btn.textContent = "Watch";
+    const caption = document.createElement("p");
+    caption.className = "movie-list-item-caption";
+    caption.textContent = movie.title || "Untitled";
 
     item.appendChild(img);
-    item.appendChild(title);
-    item.appendChild(desc);
-    item.appendChild(btn);
+    item.appendChild(caption);
     listEl.appendChild(item);
   });
 
@@ -201,14 +207,32 @@ function getOrderedCustomListNames(data) {
 }
 
 async function renderDynamicLists() {
-  const data = await fetchAllDataPreferApi();
   const root = document.getElementById("dynamic-lists-root");
   if (!root) return;
 
-  root.innerHTML = "";
+  root.innerHTML =
+    '<p class="home-status-msg">Loading movies…</p>';
+
+  let data;
+  try {
+    data = await fetchAllDataPreferApi();
+  } catch (err) {
+    console.error(err);
+    root.innerHTML =
+      '<p class="home-status-msg home-status-msg--error">Movies load nahi ho paye. Server chalao: <code>node server.js</code> phir kholo <a href="http://localhost:3001">http://localhost:3001</a></p>';
+    return;
+  }
 
   const movies = data.movies || {};
   const allKeys = Object.keys(movies);
+
+  if (!allKeys.length) {
+    root.innerHTML =
+      '<p class="home-status-msg">Abhi koi movie library me nahi. Admin panel se titles add karein.</p>';
+    return;
+  }
+
+  root.innerHTML = "";
 
   const listNames = getOrderedCustomListNames(data);
 
@@ -270,25 +294,12 @@ async function performSearch(query) {
     img.src = movie.posterUrl || "img/1.jpeg";
     img.alt = movie.title || "";
 
-    const title = document.createElement("span");
-    title.className = "movie-list-item-title";
-    title.textContent = movie.title || "Untitled";
-
-    const desc = document.createElement("p");
-    desc.className = "movie-list-item-desc";
-    desc.textContent =
-      movie.overview || "No description available for this title yet.";
-
-    const btn = document.createElement("button");
-    btn.className = "movie-list-item-button";
-    btn.textContent = "Watch";
-
-    // Button inherits card click; no separate handler needed
+    const caption = document.createElement("p");
+    caption.className = "movie-list-item-caption";
+    caption.textContent = movie.title || "Untitled";
 
     item.appendChild(img);
-    item.appendChild(title);
-    item.appendChild(desc);
-    item.appendChild(btn);
+    item.appendChild(caption);
     resultsList.appendChild(item);
   });
 
@@ -324,17 +335,20 @@ async function initBannerSlider() {
   if (!root) return;
 
   const data = await fetchAllDataPreferApi();
+  const movies = data.movies || {};
   const banners = Array.isArray(data.banners) ? data.banners : [];
   if (!banners.length) {
     root.style.display = "none";
     return;
   }
 
+  const multi = banners.length > 1;
   root.style.display = "block";
   root.innerHTML = "";
 
   let currentIndex = 0;
   let timerId = null;
+  let suppressClick = false;
 
   const slideHost = document.createElement("div");
   slideHost.className = "banner-slide-host";
@@ -343,9 +357,42 @@ async function initBannerSlider() {
   slideHost.appendChild(track);
   root.appendChild(slideHost);
 
+  if (multi) {
+    const controls = document.createElement("div");
+    controls.className = "banner-controls";
+
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "banner-control-btn";
+    prevBtn.setAttribute("aria-label", "Previous banner");
+    prevBtn.innerHTML = "&#10094;";
+    prevBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      userGoTo(currentIndex - 1);
+    });
+
+    const nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "banner-control-btn";
+    nextBtn.setAttribute("aria-label", "Next banner");
+    nextBtn.innerHTML = "&#10095;";
+    nextBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      userGoTo(currentIndex + 1);
+    });
+
+    controls.appendChild(prevBtn);
+    controls.appendChild(nextBtn);
+    slideHost.appendChild(controls);
+  }
+
   const dotsHost = document.createElement("div");
   dotsHost.className = "banner-dots";
-  root.appendChild(dotsHost);
+  if (multi) root.appendChild(dotsHost);
+
+  const openBannerMovie = (banner) => {
+    goToBannerTarget(banner, movies);
+  };
 
   const buildSlide = (banner) => {
     const slide = document.createElement("div");
@@ -355,6 +402,8 @@ async function initBannerSlider() {
     img.className = "banner-slide-img";
     img.src = banner.imageDataUrl || "";
     img.alt = banner.title || "Banner";
+    img.decoding = "async";
+    img.draggable = false;
     slide.appendChild(img);
 
     const overlay = document.createElement("div");
@@ -376,37 +425,41 @@ async function initBannerSlider() {
     cta.textContent = "Play Now";
     cta.addEventListener("click", (e) => {
       e.stopPropagation();
-      goToBannerTarget(banner);
+      openBannerMovie(banner);
     });
     overlay.appendChild(cta);
 
     slide.appendChild(overlay);
-    slide.addEventListener("click", () => goToBannerTarget(banner));
+    slide.addEventListener("click", () => {
+      if (suppressClick) return;
+      openBannerMovie(banner);
+    });
     return slide;
   };
 
   const slideEls = banners.map((b) => buildSlide(b));
-  slideEls.forEach((el) => track.appendChild(el));
+
+  slideEls.forEach((el) => {
+    track.appendChild(el);
+  });
 
   const updateTrack = () => {
-    track.style.transform = `translateX(-${currentIndex * 100}%)`;
+    const w = slideHost.clientWidth || 0;
+    track.style.transform = w ? `translateX(-${currentIndex * w}px)` : "";
     slideEls.forEach((el, i) => {
       el.classList.toggle("active", i === currentIndex);
     });
   };
 
   const renderDots = () => {
+    if (!multi) return;
     dotsHost.innerHTML = "";
     banners.forEach((_, i) => {
       const dot = document.createElement("button");
       dot.className = "banner-dot" + (i === currentIndex ? " active" : "");
       dot.type = "button";
       dot.setAttribute("aria-label", `Go to banner ${i + 1}`);
-      dot.addEventListener("click", () => {
-        stopTimer();
-        goTo(i);
-        startTimer();
-      });
+      dot.addEventListener("click", () => userGoTo(i));
       dotsHost.appendChild(dot);
     });
   };
@@ -418,109 +471,119 @@ async function initBannerSlider() {
     renderDots();
   };
 
+  const userGoTo = (idx) => {
+    goTo(idx);
+    restartAutoSlide();
+  };
+
   const stopTimer = () => {
     if (timerId) clearInterval(timerId);
     timerId = null;
   };
 
-  const startTimer = () => {
+  const restartAutoSlide = () => {
     stopTimer();
+    if (!multi) return;
     timerId = setInterval(() => {
       goTo(currentIndex + 1);
     }, 5000);
   };
 
-  // Netflix-like UX: pause auto-slide while hovering/focusing the hero.
-  root.addEventListener("mouseenter", stopTimer);
-  root.addEventListener("mouseleave", startTimer);
-  root.addEventListener("focusin", stopTimer);
-  root.addEventListener("focusout", startTimer);
-
-  // Mobile swipe support for banner slider.
   let touchStartX = 0;
   let touchStartY = 0;
   let dragging = false;
+
+  const onPointerDown = (clientX, clientY) => {
+    if (!multi) return;
+    dragging = true;
+    touchStartX = clientX;
+    touchStartY = clientY;
+  };
+
+  const onPointerUp = (clientX, clientY) => {
+    if (!dragging) return;
+    dragging = false;
+    const dx = clientX - touchStartX;
+    const dy = clientY - touchStartY;
+    if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy)) return;
+    suppressClick = true;
+    setTimeout(() => {
+      suppressClick = false;
+    }, 320);
+    if (dx < 0) userGoTo(currentIndex + 1);
+    else userGoTo(currentIndex - 1);
+  };
+
   slideHost.addEventListener(
     "touchstart",
     (e) => {
-      const t = e.changedTouches && e.changedTouches[0];
+      const t = e.changedTouches?.[0];
       if (!t) return;
-      dragging = true;
-      touchStartX = t.clientX;
-      touchStartY = t.clientY;
+      onPointerDown(t.clientX, t.clientY);
     },
     { passive: true }
   );
   slideHost.addEventListener(
     "touchend",
     (e) => {
-      if (!dragging) return;
-      dragging = false;
-      const t = e.changedTouches && e.changedTouches[0];
+      const t = e.changedTouches?.[0];
       if (!t) return;
-      const dx = t.clientX - touchStartX;
-      const dy = t.clientY - touchStartY;
-      if (Math.abs(dx) < 35 || Math.abs(dx) < Math.abs(dy)) return;
-      stopTimer();
-      if (dx < 0) goTo(currentIndex + 1);
-      else goTo(currentIndex - 1);
-      startTimer();
+      onPointerUp(t.clientX, t.clientY);
     },
     { passive: true }
   );
+  slideHost.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    onPointerDown(e.clientX, e.clientY);
+  });
+  slideHost.addEventListener("mouseup", (e) => {
+    if (e.button !== 0) return;
+    onPointerUp(e.clientX, e.clientY);
+  });
 
-  // Keyboard support
   root.addEventListener("keydown", (e) => {
+    if (!multi) return;
     if (e.key === "ArrowLeft") {
-      stopTimer();
-      goTo(currentIndex - 1);
-      startTimer();
+      e.preventDefault();
+      userGoTo(currentIndex - 1);
     } else if (e.key === "ArrowRight") {
-      stopTimer();
-      goTo(currentIndex + 1);
-      startTimer();
+      e.preventDefault();
+      userGoTo(currentIndex + 1);
     }
   });
   root.tabIndex = 0;
 
+  window.addEventListener("resize", updateTrack);
+
   goTo(0);
-  startTimer();
+  requestAnimationFrame(updateTrack);
+  restartAutoSlide();
 }
 
-async function goToBannerTarget(banner) {
-  const data = await fetchAllDataPreferApi();
-  const movies = data.movies || {};
-  const tmdbId = String(banner.tmdbId || "");
+function goToBannerTarget(banner, moviesFromCaller) {
+  const movies = moviesFromCaller || {};
+  const movieKey = String(banner?.movieKey || "").trim();
+  if (movieKey && movies[movieKey]) {
+    navigateToMoviePlayer(movies[movieKey], movieKey);
+    return;
+  }
+
+  const tmdbId = String(banner?.tmdbId || "").trim();
   if (!tmdbId) return;
 
-  // If content type is provided, jump directly to the matching movie key.
   if (banner.contentType) {
     const targetKey = `${banner.contentType}-${tmdbId}`;
     if (movies[targetKey]) {
-      redirectToMoviePlayer(movies[targetKey], targetKey);
+      navigateToMoviePlayer(movies[targetKey], targetKey);
       return;
     }
   }
 
-  // Fallback: find first match by tmdbId.
-  let foundKey = null;
-  let foundMovie = null;
-  const keys = Object.keys(movies);
-  for (const key of keys) {
+  for (const key of Object.keys(movies)) {
     const m = movies[key];
-    if (!m) continue;
-    if (String(m.tmdbId) === tmdbId) {
-      foundKey = key;
-      foundMovie = m;
-      break;
+    if (m && String(m.tmdbId) === tmdbId) {
+      navigateToMoviePlayer(m, key);
+      return;
     }
   }
-
-  if (foundKey && foundMovie) {
-    redirectToMoviePlayer(foundMovie, foundKey);
-  }
-}
-
-function redirectToMoviePlayer(movie, movieKey) {
-  navigateToMoviePlayer(movie, movieKey);
 }

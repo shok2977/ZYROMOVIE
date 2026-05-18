@@ -5,7 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="robots" content="index, follow" />
   <meta name="theme-color" content="#151515" />
-  <meta name="description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
+  <meta
+    name="description"
+    content="ZyroMovies blog — movie reviews, infinity castle, anime and watch online guides. Zyro Movies streaming updates."
+  />
+  <meta
+    name="keywords"
+    content="zyro movies, zyromovies, ZyroMovies, zyro movie, watch online, infinity castle, movie blog, anime blog"
+  />
   <meta property="og:type" content="website" />
   <meta property="og:title" content="ZyroMovies Blog" />
   <meta property="og:description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
@@ -15,7 +22,7 @@
   <meta name="twitter:title" content="ZyroMovies Blog" />
   <meta name="twitter:description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
   <meta name="twitter:image" content="https://zyromovie.onrender.com/img/1.jpeg" />
-  <link rel="canonical" href="https://zyromovie.onrender.com/blog" />
+  <link rel="canonical" href="https://zyromovie.onrender.com/blog.html" />
   <link rel="stylesheet" href="style.css" />
   <title>ZyroMovies Blog</title>
 </head>
@@ -44,6 +51,9 @@
           &larr; Back to all blogs
         </a>
         <h1 id="blog-detail-title" class="movie-list-title"></h1>
+        <div id="blog-play-wrap" class="blog-play-wrap" style="display: none;">
+          <a id="blog-play-btn" class="blog-play-btn" href="#">▶ Watch Online</a>
+        </div>
         <div id="blog-detail-intro-wrap" class="blog-detail-intro-wrap" style="display: none;">
           <h2 class="blog-block-label">Intro</h2>
           <p id="blog-detail-description" class="blog-detail-description"></p>
@@ -57,6 +67,7 @@
     <a href="blog.html" class="site-blog-link">BLOG</a>
   </footer>
 
+  <script src="api-config.js"></script>
   <script src="blog.js"></script>
 </body>
 </html>

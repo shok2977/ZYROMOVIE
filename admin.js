@@ -2,18 +2,54 @@ const ADMIN_ID = "Adityasharma123";
 const ADMIN_PASSWORD = "Aditya@sharma2977";
 const TMDB_API_KEY = "e84730516a1d5987f96fd63d46d2f119";
 
-// Use same-origin API in production (Render), still works locally.
 const API_BASE =
-  window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
-    ? "http://localhost:3001"
-    : "";
+  typeof window.ZYRO_API_BASE === "string"
+    ? window.ZYRO_API_BASE
+    : window.location.hostname === "localhost" ||
+        window.location.hostname === "127.0.0.1"
+      ? "http://localhost:3001"
+      : "";
 let cachedData = { movies: {}, lists: {}, banners: [], listOrder: [] };
 const LOCAL_STORAGE_KEY = "flakes_movies_data";
 
+function apiUrl(path) {
+  const p = String(path || "").startsWith("/") ? path : `/${path}`;
+  return `${API_BASE}${p}`;
+}
+
+async function adminFetch(path, options = {}, timeoutMs = 90000) {
+  const url = String(path).startsWith("http") ? path : apiUrl(path);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error("Request bahut der tak chali — dubara try karein.");
+    }
+    const msg = String(err?.message || err);
+    if (msg === "Failed to fetch" || /networkerror|load failed/i.test(msg)) {
+      const hint = API_BASE || window.location.origin;
+      throw new Error(
+        `Server se connect nahi ho paya (${hint}). Terminal me "node server.js" chalao, phir browser me ${hint}/admin/ kholo — file:// se mat kholo.`
+      );
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function refreshData() {
-  const res = await fetch(`${API_BASE}/api/data`);
-  if (!res.ok) throw new Error("Failed to load data from API");
-  cachedData = await res.json();
+  const res = await adminFetch("/api/data");
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      payload.error ||
+        `API se data load nahi hua (HTTP ${res.status}). Kholo: ${API_BASE || window.location.origin}/admin/`
+    );
+  }
+  cachedData = payload;
   // Normalize shape
   cachedData.movies = cachedData.movies || {};
   cachedData.lists = cachedData.lists || {};
@@ -54,17 +90,22 @@ function getOrderedCustomListNames(data) {
 }
 
 async function upsertMovie(movie) {
-  const res = await fetch(`${API_BASE}/api/movie`, {
+  const res = await adminFetch("/api/movie", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(movie),
   });
-  if (!res.ok) throw new Error("Failed to upsert movie");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      data.error || `Movie save failed (HTTP ${res.status}). Server + MongoDB check karein.`
+    );
+  }
+  return data;
 }
 
 async function deleteMovie(key) {
-  const res = await fetch(`${API_BASE}/api/movie/${encodeURIComponent(key)}`, {
+  const res = await adminFetch(`/api/movie/${encodeURIComponent(key)}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error("Failed to delete movie");
@@ -72,23 +113,29 @@ async function deleteMovie(key) {
 }
 
 async function upsertList(name) {
-  const res = await fetch(`${API_BASE}/api/list`, {
+  const res = await adminFetch("/api/list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
   });
-  if (!res.ok) throw new Error("Failed to upsert list");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `List save failed (HTTP ${res.status})`);
+  }
+  return data;
 }
 
 async function assignMovieToList(name, key) {
-  const res = await fetch(`${API_BASE}/api/list/assign`, {
+  const res = await adminFetch("/api/list/assign", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, key }),
   });
-  if (!res.ok) throw new Error("Failed to assign movie to list");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Assign to list failed (HTTP ${res.status})`);
+  }
+  return data;
 }
 
 async function reorderListsApi(order) {
@@ -453,7 +500,7 @@ function renderLists() {
   if (!listsTable || !assignListSelect) return;
 
   listsTable.innerHTML = "";
-  assignListSelect.innerHTML = "";
+  populateAssignListSelect(data);
 
   const note = document.createElement("p");
   note.className = "admin-help-text";
@@ -466,7 +513,8 @@ function renderLists() {
   if (listNames.length === 0) {
     const empty = document.createElement("p");
     empty.className = "admin-empty";
-    empty.textContent = "No custom lists yet. Create some above.";
+    empty.textContent =
+      'No custom lists yet. Upar "New list" se banayein (jaise Anime, Best) — phir title add karein.';
     listsTable.appendChild(empty);
     return;
   }
@@ -504,13 +552,9 @@ function renderLists() {
     row.appendChild(nameCell);
     row.appendChild(countCell);
     table.appendChild(row);
-
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = name;
-    assignListSelect.appendChild(opt);
   });
   listsTable.appendChild(table);
+  populateAssignListSelect(data);
 
   const saveOrderBtn = document.createElement("button");
   saveOrderBtn.type = "button";
@@ -655,16 +699,19 @@ async function renderBlogs() {
   });
 }
 
-async function fetchTmdbDetails(tmdbId, type) {
-  const base = "https://api.themoviedb.org/3";
-  const path =
-    type === "movie" || type === "animeMovie"
-      ? `/movie/${tmdbId}`
-      : `/tv/${tmdbId}`;
-  const url = `${base}${path}?api_key=${TMDB_API_KEY}&language=en-US`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`TMDB request failed (status ${res.status})`);
-  const data = await res.json();
+function parseTmdbIdInput(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  if (/^\d+$/.test(s)) return s;
+  const fromPath = s.match(/(?:movie|tv)\/(\d+)/i);
+  if (fromPath) return fromPath[1];
+  const fromQuery = s.match(/[?&]tmdb_id=(\d+)/i);
+  if (fromQuery) return fromQuery[1];
+  const digits = s.match(/(\d{1,9})/);
+  return digits ? digits[1] : "";
+}
+
+function tmdbMetaFromPayload(data) {
   return {
     title: data.title || data.name || "",
     overview: data.overview || "",
@@ -677,31 +724,183 @@ async function fetchTmdbDetails(tmdbId, type) {
   };
 }
 
-async function fetchTmdbTvSeasons(tmdbId) {
-  const base = "https://api.themoviedb.org/3";
-  const tvRes = await fetch(
-    `${base}/tv/${tmdbId}?api_key=${TMDB_API_KEY}&language=en-US`
-  );
-  if (!tvRes.ok) return [];
-  const tv = await tvRes.json();
-  const numSeasons = Math.min(tv.number_of_seasons || 0, 20);
-  const seasons = [];
+function buildTmdbTryTypes(preferredType) {
+  const tryOrder = [];
+  const push = (t) => {
+    if (t && !tryOrder.includes(t)) tryOrder.push(t);
+  };
+  push(preferredType || "movie");
+  if (preferredType === "movie" || preferredType === "animeMovie") {
+    push("tv");
+    push("anime");
+  } else {
+    push("movie");
+    push("animeMovie");
+  }
+  return tryOrder;
+}
 
-  for (let s = 1; s <= numSeasons; s++) {
-    try {
-      const seasonRes = await fetch(
-        `${base}/tv/${tmdbId}/season/${s}?api_key=${TMDB_API_KEY}&language=en-US`
+/** Browser → TMDB (reliable); server proxy is optional fallback. */
+async function tmdbDirectGet(pathAndQuery) {
+  const sep = String(pathAndQuery).includes("?") ? "&" : "?";
+  const url = `https://api.themoviedb.org/3${pathAndQuery}${sep}api_key=${encodeURIComponent(TMDB_API_KEY)}&language=en-US`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    if (res.status === 401) {
+      throw new Error(
+        "TMDB API key invalid hai. themoviedb.org → Settings → API se naya key banao aur admin.js me lagao."
       );
-      if (!seasonRes.ok) continue;
-      const seasonData = await seasonRes.json();
-      const episodes = (seasonData.episodes || []).map((ep) => ({
-        episode_number: ep.episode_number,
-        name: ep.name || `Episode ${ep.episode_number}`,
-      }));
-      seasons.push({ season_number: s, episodes });
+    }
+    const err = new Error(`TMDB error ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function resolveTmdbMetaDirect(tmdbIdRaw, preferredType = "movie") {
+  const raw = String(tmdbIdRaw || "").trim();
+  if (/^tt\d+$/i.test(raw)) {
+    const found = await tmdbDirectGet(
+      `/find/${encodeURIComponent(raw)}?external_source=imdb_id`
+    );
+    const movie = found.movie_results?.[0];
+    if (movie?.id) {
+      return {
+        tmdbId: String(movie.id),
+        type: "movie",
+        meta: tmdbMetaFromPayload(movie),
+      };
+    }
+    const tv = found.tv_results?.[0];
+    if (tv?.id) {
+      return {
+        tmdbId: String(tv.id),
+        type: "tv",
+        meta: tmdbMetaFromPayload(tv),
+      };
+    }
+  }
+
+  const tmdbId = parseTmdbIdInput(raw);
+  if (!tmdbId) {
+    throw new Error(
+      "Galat TMDB ID. Number (550) ya themoviedb.org ka poora link paste karein."
+    );
+  }
+
+  for (const type of buildTmdbTryTypes(preferredType)) {
+    try {
+      const path =
+        type === "movie" || type === "animeMovie"
+          ? `/movie/${tmdbId}`
+          : `/tv/${tmdbId}`;
+      const data = await tmdbDirectGet(path);
+      const meta = tmdbMetaFromPayload(data);
+      if (meta.title?.trim()) {
+        return { tmdbId, type, meta };
+      }
+    } catch (_) {}
+  }
+
+  throw new Error(
+    `TMDB par ID "${tmdbId}" nahi mila. themoviedb.org par us title ki page kholo — URL me /movie/ ya /tv/ ke baad wala number copy karein.`
+  );
+}
+
+async function fetchTmdbDetails(tmdbId, type) {
+  const resolved = await resolveTmdbMetaDirect(String(tmdbId), type);
+  return resolved.meta;
+}
+
+async function fetchTmdbMetaForAdd(tmdbIdRaw, preferredType) {
+  try {
+    return await resolveTmdbMetaDirect(tmdbIdRaw, preferredType);
+  } catch (directErr) {
+    try {
+      const q = new URLSearchParams({
+        tmdbId: String(tmdbIdRaw).trim(),
+        type: String(preferredType || "movie"),
+      });
+      const res = await adminFetch(`/api/tmdb/resolve?${q}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw directErr;
+      if (!data?.meta?.title?.trim()) throw directErr;
+      return {
+        meta: data.meta,
+        type: data.type || preferredType,
+        tmdbId: String(data.tmdbId || parseTmdbIdInput(tmdbIdRaw) || tmdbIdRaw),
+      };
+    } catch (_) {
+      throw directErr;
+    }
+  }
+}
+
+function populateAssignListSelect(data) {
+  const select = document.getElementById("assign-list");
+  if (!select) return false;
+
+  const prev = select.value;
+  select.innerHTML = "";
+  const listNames = getOrderedCustomListNames(data);
+
+  if (!listNames.length) {
+    const opt = document.createElement("option");
+    opt.value = "";
+    opt.textContent = "Pehle Lists tab se list banayein (Anime, Best, …)";
+    select.appendChild(opt);
+    return false;
+  }
+
+  listNames.forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    select.appendChild(opt);
+  });
+
+  if (prev && listNames.includes(prev)) select.value = prev;
+  return true;
+}
+
+async function fetchTmdbTvSeasonsDirect(tmdbId, maxSeasons = 3) {
+  const id = parseTmdbIdInput(tmdbId) || String(tmdbId).trim();
+  const tv = await tmdbDirectGet(`/tv/${id}`);
+  const total = Math.min(tv.number_of_seasons || 0, maxSeasons);
+  const seasons = [];
+  for (let s = 1; s <= total; s++) {
+    try {
+      const seasonData = await tmdbDirectGet(`/tv/${id}/season/${s}`);
+      seasons.push({
+        season_number: s,
+        episodes: (seasonData.episodes || []).map((ep) => ({
+          episode_number: ep.episode_number,
+          name: ep.name || `Episode ${ep.episode_number}`,
+        })),
+      });
     } catch (_) {}
   }
   return seasons;
+}
+
+async function fetchTmdbTvSeasons(tmdbId, maxSeasons = 3) {
+  try {
+    return await fetchTmdbTvSeasonsDirect(tmdbId, maxSeasons);
+  } catch (_) {
+    const q = new URLSearchParams({
+      tmdbId: String(tmdbId),
+      max: String(maxSeasons),
+    });
+    const res = await adminFetch(`/api/tmdb/seasons?${q}`, {}, 120000);
+    const data = await res.json().catch(() => []);
+    if (!res.ok) {
+      throw new Error(
+        (data && data.error) || `TMDB seasons failed (HTTP ${res.status})`
+      );
+    }
+    return Array.isArray(data) ? data : [];
+  }
 }
 
 async function detectTmdbType(tmdbId) {
@@ -781,9 +980,17 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   document.querySelectorAll(".admin-nav-btn").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const t = btn.getAttribute("data-section");
       if (t) switchSection(t);
+      if (t === "add-movie-section") {
+        try {
+          await ensureDefaultListsInApi();
+          renderLists();
+        } catch (err) {
+          console.error(err);
+        }
+      }
     });
   });
 
@@ -828,6 +1035,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const blogTmdbInput = document.getElementById("blog-tmdb-id");
   const blogContentType = document.getElementById("blog-content-type");
   const blogDescription = document.getElementById("blog-description");
+  const blogSeoKeywords = document.getElementById("blog-seo-keywords");
   const blogsList = document.getElementById("blogs-list");
   const blogSectionsList = document.getElementById("blog-sections-list");
   const addBlogSectionBtn = document.getElementById("add-blog-section-btn");
@@ -943,11 +1151,21 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (uploadStatus) uploadStatus.textContent = "Uploading image...";
         try {
           const dataUrl = await readFileAsDataUrl(file);
-          const imageUrl = await uploadBlogImage(dataUrl);
-          item._blogImageUrl = imageUrl;
-          if (previewImg) previewImg.src = resolveAssetUrl(imageUrl);
+          let imageRef = "";
+          try {
+            imageRef = await uploadBlogImage(dataUrl);
+          } catch (uploadErr) {
+            console.warn("File upload failed, saving embedded image.", uploadErr);
+            imageRef = dataUrl;
+          }
+          item._blogImageUrl = imageRef;
+          if (previewImg) previewImg.src = resolveAssetUrl(imageRef);
           applySectionPreviewStyle(item);
-          if (uploadStatus) uploadStatus.textContent = "Image uploaded.";
+          if (uploadStatus) {
+            uploadStatus.textContent = imageRef.startsWith("data:")
+              ? "Image saved (embedded)."
+              : "Image uploaded.";
+          }
         } catch (err) {
           console.error(err);
           item._blogImageUrl = "";
@@ -955,7 +1173,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           if (uploadStatus) uploadStatus.textContent = "";
           if (addBlogError) {
             addBlogError.textContent =
-              err?.message || "Failed to upload section image.";
+              err?.message || "Failed to read section image.";
           }
         }
       });
@@ -981,7 +1199,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     items.forEach((item) => {
       const textBefore = item.querySelector(".blog-section-before")?.value?.trim() || "";
       const textAfter = item.querySelector(".blog-section-after")?.value?.trim() || "";
-      const imageDataUrl = String(item._blogImageUrl || "").trim();
+      const imageDataUrl = String(item._blogImageUrl || item._blogImageData || "").trim();
       const imageKind = getSectionImageKind(item);
 
       if (!textBefore && !textAfter && !imageDataUrl) return;
@@ -1118,6 +1336,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       const tmdbId = blogTmdbInput?.value?.trim() || "";
       const type = blogContentType?.value || "movie";
       const description = blogDescription?.value?.trim() || "";
+      const seoKeywords = blogSeoKeywords?.value?.trim() || "";
 
       if (!tmdbId) {
         if (addBlogError) addBlogError.textContent = "TMDB ID is required.";
@@ -1159,11 +1378,13 @@ document.addEventListener("DOMContentLoaded", async () => {
           posterUrl: meta.posterUrl,
           bannerUrl: meta.bannerUrl,
           description,
+          seoKeywords,
           sections: preparedSections,
           createdAt: Date.now(),
         });
         if (blogTmdbInput) blogTmdbInput.value = "";
         if (blogDescription) blogDescription.value = "";
+        if (blogSeoKeywords) blogSeoKeywords.value = "";
         resetBlogSections();
         if (addBlogSuccess) addBlogSuccess.textContent = "Blog published.";
         await renderBlogs();
@@ -1221,7 +1442,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       addTitleError.textContent = "";
       addTitleSuccess.textContent = "";
 
-      const tmdbId = (document.getElementById("tmdb-id")?.value || "").trim();
+      const saveBtn = addTitleForm.querySelector('button[type="submit"]');
+
+      const tmdbIdRaw = (document.getElementById("tmdb-id")?.value || "").trim();
+      const tmdbId = parseTmdbIdInput(tmdbIdRaw) || tmdbIdRaw;
       const selectedType =
         document.getElementById("content-type")?.value || "movie";
       const listName = document.getElementById("assign-list")?.value || "";
@@ -1231,22 +1455,41 @@ document.addEventListener("DOMContentLoaded", async () => {
         document.getElementById("download-fluid-script")?.value || "";
       const epContainer = document.getElementById("download-episodes-container");
 
-      if (!tmdbId || !listName) {
-        addTitleError.textContent = "TMDB ID and list are required.";
+      if (!tmdbIdRaw) {
+        addTitleError.textContent = "TMDB ID zaroori hai.";
         return;
       }
+      if (!parseTmdbIdInput(tmdbIdRaw) && !/^tt\d+$/i.test(tmdbIdRaw)) {
+        addTitleError.textContent =
+          "Galat format. Sirf number (550) ya themoviedb.org link paste karein.";
+        return;
+      }
+
+      if (!listName) {
+        addTitleError.textContent =
+          'Pehle "Assign to list" se list choose karein. Lists tab se nayi list bana sakte hain.';
+        return;
+      }
+
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.textContent = "Saving…";
+      }
+
+      try {
       let type = selectedType;
       let detectedDownloadSeasons = [];
       if (sourceKind === "download") {
-        try {
           if (
-            currentDownloadEpisodesTmdb === tmdbId &&
+            currentDownloadEpisodesTmdb === tmdbIdRaw &&
             Array.isArray(currentDownloadEpisodesSeasons)
           ) {
             detectedDownloadSeasons = currentDownloadEpisodesSeasons;
           } else {
-            detectedDownloadSeasons = await fetchTmdbTvSeasons(tmdbId);
-            currentDownloadEpisodesTmdb = tmdbId;
+            detectedDownloadSeasons = await fetchTmdbTvSeasons(
+              tmdbId || tmdbIdRaw
+            );
+            currentDownloadEpisodesTmdb = tmdbIdRaw;
             currentDownloadEpisodesSeasons = detectedDownloadSeasons;
           }
           const hasSeriesByTmdb =
@@ -1268,34 +1511,30 @@ document.addEventListener("DOMContentLoaded", async () => {
                 ? "animeMovie"
                 : "movie";
           }
-        } catch (err) {
-          addTitleError.textContent = err?.message || "TMDB type detect failed.";
-          return;
-        }
       }
 
       let meta;
       let seasons = [];
-      try {
-        meta = await fetchTmdbDetails(tmdbId, type);
+        if (saveBtn) saveBtn.textContent = "TMDB…";
+        const tmdbResult = await fetchTmdbMetaForAdd(tmdbIdRaw, type);
+        meta = tmdbResult.meta;
+        type = tmdbResult.type;
+        const resolvedTmdbId = tmdbResult.tmdbId || tmdbId;
         if (type === "tv" || type === "anime") {
+          if (saveBtn) saveBtn.textContent = "Episodes…";
           seasons =
             Array.isArray(detectedDownloadSeasons) &&
             detectedDownloadSeasons.length
               ? detectedDownloadSeasons
-              : await fetchTmdbTvSeasons(tmdbId);
+              : await fetchTmdbTvSeasons(resolvedTmdbId, sourceKind === "download" ? 10 : 3);
         }
-      } catch (err) {
-        console.error(err);
-        addTitleError.textContent = err?.message || "Failed to load TMDB data.";
-        meta = { title: "", overview: "", posterUrl: "" };
-      }
+        if (saveBtn) saveBtn.textContent = "Saving…";
 
-      const key = getMovieIdKey(tmdbId, type);
+      const key = getMovieIdKey(resolvedTmdbId, type);
 
       const movieRecord = {
         key,
-        tmdbId,
+        tmdbId: resolvedTmdbId,
         type,
         title: meta.title,
         overview: meta.overview,
@@ -1344,19 +1583,39 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
 
-      // Save to MongoDB (via API)
-      await upsertList(listName);
-      await upsertMovie(movieRecord);
-      await assignMovieToList(listName, key);
-      await refreshData();
-      renderDashboard();
-      renderLists();
+        await upsertList(listName);
+        await upsertMovie(movieRecord);
+        await assignMovieToList(listName, key);
 
-      const tmdbInput = document.getElementById("tmdb-id");
-      if (tmdbInput) tmdbInput.value = "";
-      const scriptInput = document.getElementById("download-fluid-script");
-      if (scriptInput) scriptInput.value = "";
-      addTitleSuccess.textContent = "Title saved successfully.";
+        cachedData.movies = cachedData.movies || {};
+        cachedData.movies[key] = movieRecord;
+        cachedData.lists = cachedData.lists || {};
+        if (!Array.isArray(cachedData.lists[listName])) {
+          cachedData.lists[listName] = [];
+        }
+        if (!cachedData.lists[listName].includes(key)) {
+          cachedData.lists[listName].push(key);
+        }
+        renderDashboard();
+        renderLists();
+        refreshData().catch((e) => console.warn("Background refresh:", e));
+
+        const tmdbInput = document.getElementById("tmdb-id");
+        if (tmdbInput) tmdbInput.value = "";
+        const scriptInput = document.getElementById("download-fluid-script");
+        if (scriptInput) scriptInput.value = "";
+        addTitleSuccess.textContent = `"${meta.title}" save ho gaya — home page par list "${listName}" me dikhega.`;
+      } catch (err) {
+        console.error(err);
+        addTitleError.textContent =
+          err?.message ||
+          "Save fail. Terminal me `node server.js` chalao aur MongoDB connected hona chahiye.";
+      } finally {
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.textContent = "Save Title";
+        }
+      }
     });
   }
 
