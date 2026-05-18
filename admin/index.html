@@ -296,7 +296,9 @@
           <section id="blogs-section" class="admin-section">
             <h2 class="admin-section-title">Create Blog</h2>
             <p class="admin-help-text">
-              TMDB ID se movie ka title/banner auto fetch hoga. Aap apni custom description add kar sakte hain.
+              TMDB ID se movie ka title/banner auto fetch hoga. Neeche intro likho, phir jitni
+              baar chaho photo/banner sections add karo — har section me image se pehle aur baad
+              me text likh sakte ho.
             </p>
             <form id="add-blog-form" class="admin-form">
               <label class="admin-label" for="blog-tmdb-id">TMDB ID</label>
@@ -313,13 +315,28 @@
                 <option value="tv">TV Show</option>
               </select>
 
-              <label class="admin-label" for="blog-description">Blog Description</label>
-              <textarea
-                id="blog-description"
-                class="admin-input"
-                rows="6"
-                placeholder="Write full blog content here..."
-              ></textarea>
+              <div class="blog-intro-panel">
+                <h3 class="blog-panel-title">Intro text (top of blog)</h3>
+                <div class="blog-field-group">
+                  <label class="admin-label" for="blog-description">Opening paragraph</label>
+                  <textarea
+                    id="blog-description"
+                    class="admin-input"
+                    rows="4"
+                    placeholder="Blog shuru hone se pehle yahan likhein..."
+                  ></textarea>
+                </div>
+              </div>
+
+              <div class="blog-sections-builder">
+                <div class="blog-sections-builder-head">
+                  <h3 class="blog-panel-title">Photo / Banner sections</h3>
+                  <button type="button" id="add-blog-section-btn" class="admin-secondary-btn">
+                    + Add section
+                  </button>
+                </div>
+                <div id="blog-sections-list" class="blog-sections-list"></div>
+              </div>
 
               <button type="submit" class="admin-primary-btn">Publish Blog</button>
               <p class="admin-error" id="add-blog-error"></p>

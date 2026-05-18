@@ -119,14 +119,26 @@ async function deleteBanner(id) {
   return await res.json();
 }
 
+async function uploadBlogImage(dataUrl) {
+  const res = await fetch(`${API_BASE}/api/blog/upload-image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dataUrl }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Failed to upload image");
+  return data.url;
+}
+
 async function addBlog(payload) {
   const res = await fetch(`${API_BASE}/api/blog`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error("Failed to add blog");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Failed to add blog");
+  return data;
 }
 
 async function fetchBlogs() {
@@ -599,6 +611,16 @@ function renderBanners() {
   });
 }
 
+function getBlogPreviewText(blog) {
+  if (blog?.description) return blog.description;
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  for (const section of sections) {
+    if (section?.textBefore) return section.textBefore;
+    if (section?.textAfter) return section.textAfter;
+  }
+  return blog?.overview || "";
+}
+
 async function renderBlogs() {
   const blogsListEl = document.getElementById("blogs-list");
   if (!blogsListEl) return;
@@ -624,7 +646,8 @@ async function renderBlogs() {
     row.innerHTML = `
       <div>${blog.title || "Untitled"}</div>
       <div>TMDB ${blog.tmdbId || "-"}</div>
-      <div>${(blog.description || "").slice(0, 90)}</div>
+      <div>${getBlogPreviewText(blog).slice(0, 90)}</div>
+      <div>${Array.isArray(blog.sections) ? blog.sections.length : 0} section(s)</div>
       <div><a href="../blog/${encodeURIComponent(blog.slug)}" target="_blank" rel="noopener noreferrer">Open</a></div>
       <div><button class="admin-delete-btn" data-blog-id="${blog._id}">Delete</button></div>
     `;
@@ -806,8 +829,8 @@ document.addEventListener("DOMContentLoaded", async () => {
   const blogContentType = document.getElementById("blog-content-type");
   const blogDescription = document.getElementById("blog-description");
   const blogsList = document.getElementById("blogs-list");
-
-  let currentBannerImageDataUrl = "";
+  const blogSectionsList = document.getElementById("blog-sections-list");
+  const addBlogSectionBtn = document.getElementById("add-blog-section-btn");
 
   const readFileAsDataUrl = (file) =>
     new Promise((resolve, reject) => {
@@ -816,6 +839,171 @@ document.addEventListener("DOMContentLoaded", async () => {
       reader.onerror = (err) => reject(err);
       reader.readAsDataURL(file);
     });
+
+  function resolveAssetUrl(url) {
+    if (!url) return "";
+    const value = String(url);
+    if (value.startsWith("data:") || value.startsWith("http")) return value;
+    return `${API_BASE}${value}`;
+  }
+
+  let blogSectionCounter = 0;
+
+  function getSectionImageKind(item) {
+    return item?.querySelector(".blog-section-kind")?.value === "banner"
+      ? "banner"
+      : "photo";
+  }
+
+  function applySectionPreviewStyle(item) {
+    const previewImg = item?.querySelector(".blog-section-preview");
+    const previewWrap = item?.querySelector(".blog-section-preview-wrap");
+    if (!previewImg || !previewWrap) return;
+
+    const kind = getSectionImageKind(item);
+    previewImg.classList.remove(
+      "blog-section-preview--photo",
+      "blog-section-preview--banner"
+    );
+    previewImg.classList.add(
+      kind === "banner"
+        ? "blog-section-preview--banner"
+        : "blog-section-preview--photo"
+    );
+
+    if (previewImg.getAttribute("src")) {
+      previewWrap.classList.add("is-visible");
+    } else {
+      previewWrap.classList.remove("is-visible");
+    }
+  }
+
+  function createBlogSectionItem() {
+    blogSectionCounter += 1;
+    const sectionId = blogSectionCounter;
+    const beforeId = `blog-section-before-${sectionId}`;
+    const kindId = `blog-section-kind-${sectionId}`;
+    const fileId = `blog-section-file-${sectionId}`;
+    const afterId = `blog-section-after-${sectionId}`;
+    const item = document.createElement("div");
+    item.className = "blog-section-item";
+    item.dataset.sectionId = String(sectionId);
+    item.innerHTML = `
+      <div class="blog-section-item-head">
+        <strong>Section ${sectionId}</strong>
+        <button type="button" class="admin-delete-btn blog-section-remove">Remove</button>
+      </div>
+      <div class="blog-field-group">
+        <label class="admin-label" for="${beforeId}">1. Text before image</label>
+        <textarea id="${beforeId}" class="admin-input blog-section-before" rows="4" placeholder="Image se pehle likhein..."></textarea>
+      </div>
+
+      <div class="blog-field-row">
+        <div class="blog-field-group">
+          <label class="admin-label" for="${kindId}">2. Image type</label>
+          <select id="${kindId}" class="admin-input blog-section-kind">
+            <option value="photo">Photo (portrait / normal)</option>
+            <option value="banner">Banner (full width)</option>
+          </select>
+        </div>
+        <div class="blog-field-group blog-field-group--file">
+          <label class="admin-label" for="${fileId}">3. Upload image</label>
+          <input id="${fileId}" type="file" class="blog-section-file admin-input" accept="image/*" />
+        </div>
+      </div>
+
+      <p class="blog-section-upload-status admin-small"></p>
+      <div class="blog-section-preview-wrap">
+        <img class="blog-section-preview blog-section-preview--photo" alt="Section preview" />
+      </div>
+
+      <div class="blog-field-group">
+        <label class="admin-label" for="${afterId}">4. Text after image</label>
+        <textarea id="${afterId}" class="admin-input blog-section-after" rows="4" placeholder="Image ke baad likhein..."></textarea>
+      </div>
+    `;
+
+    item._blogImageUrl = "";
+
+    const fileInput = item.querySelector(".blog-section-file");
+    const previewImg = item.querySelector(".blog-section-preview");
+    const uploadStatus = item.querySelector(".blog-section-upload-status");
+    const kindSelect = item.querySelector(".blog-section-kind");
+    const removeBtn = item.querySelector(".blog-section-remove");
+
+    if (kindSelect) {
+      kindSelect.addEventListener("change", () => applySectionPreviewStyle(item));
+    }
+
+    if (fileInput) {
+      fileInput.addEventListener("change", async () => {
+        const file = fileInput.files?.[0];
+        if (!file) return;
+        if (addBlogError) addBlogError.textContent = "";
+        if (uploadStatus) uploadStatus.textContent = "Uploading image...";
+        try {
+          const dataUrl = await readFileAsDataUrl(file);
+          const imageUrl = await uploadBlogImage(dataUrl);
+          item._blogImageUrl = imageUrl;
+          if (previewImg) previewImg.src = resolveAssetUrl(imageUrl);
+          applySectionPreviewStyle(item);
+          if (uploadStatus) uploadStatus.textContent = "Image uploaded.";
+        } catch (err) {
+          console.error(err);
+          item._blogImageUrl = "";
+          if (previewImg) previewImg.removeAttribute("src");
+          if (uploadStatus) uploadStatus.textContent = "";
+          if (addBlogError) {
+            addBlogError.textContent =
+              err?.message || "Failed to upload section image.";
+          }
+        }
+      });
+    }
+
+    if (removeBtn) {
+      removeBtn.addEventListener("click", () => item.remove());
+    }
+
+    return item;
+  }
+
+  function resetBlogSections() {
+    blogSectionCounter = 0;
+    if (blogSectionsList) blogSectionsList.innerHTML = "";
+  }
+
+  function collectBlogSections() {
+    if (!blogSectionsList) return [];
+    const items = blogSectionsList.querySelectorAll(".blog-section-item");
+    const sections = [];
+
+    items.forEach((item) => {
+      const textBefore = item.querySelector(".blog-section-before")?.value?.trim() || "";
+      const textAfter = item.querySelector(".blog-section-after")?.value?.trim() || "";
+      const imageDataUrl = String(item._blogImageUrl || "").trim();
+      const imageKind = getSectionImageKind(item);
+
+      if (!textBefore && !textAfter && !imageDataUrl) return;
+
+      sections.push({
+        textBefore,
+        textAfter,
+        imageDataUrl,
+        imageKind,
+      });
+    });
+
+    return sections;
+  }
+
+  if (addBlogSectionBtn && blogSectionsList) {
+    addBlogSectionBtn.addEventListener("click", () => {
+      blogSectionsList.appendChild(createBlogSectionItem());
+    });
+  }
+
+  let currentBannerImageDataUrl = "";
 
   async function setBannerFile(file) {
     if (!file) return;
@@ -935,12 +1123,33 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (addBlogError) addBlogError.textContent = "TMDB ID is required.";
         return;
       }
-      if (!description) {
-        if (addBlogError) addBlogError.textContent = "Description is required.";
+      const sections = collectBlogSections();
+      const hasIntro = Boolean(description);
+      const hasSectionContent = sections.some(
+        (section) =>
+          section.textBefore ||
+          section.textAfter ||
+          section.imageDataUrl
+      );
+
+      if (!hasIntro && !hasSectionContent) {
+        if (addBlogError) {
+          addBlogError.textContent =
+            "Intro text ya kam se kam ek photo/banner section add karein.";
+        }
         return;
       }
 
       try {
+        const preparedSections = [];
+        for (const section of sections) {
+          let imageDataUrl = section.imageDataUrl;
+          if (imageDataUrl.startsWith("data:")) {
+            imageDataUrl = await uploadBlogImage(imageDataUrl);
+          }
+          preparedSections.push({ ...section, imageDataUrl });
+        }
+
         const meta = await fetchTmdbDetails(tmdbId, type);
         await addBlog({
           tmdbId,
@@ -950,10 +1159,12 @@ document.addEventListener("DOMContentLoaded", async () => {
           posterUrl: meta.posterUrl,
           bannerUrl: meta.bannerUrl,
           description,
+          sections: preparedSections,
           createdAt: Date.now(),
         });
         if (blogTmdbInput) blogTmdbInput.value = "";
         if (blogDescription) blogDescription.value = "";
+        resetBlogSections();
         if (addBlogSuccess) addBlogSuccess.textContent = "Blog published.";
         await renderBlogs();
       } catch (err) {

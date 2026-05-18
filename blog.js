@@ -15,10 +15,48 @@ async function fetchBlogBySlug(slug) {
   return await res.json();
 }
 
+function getBlogExcerpt(blog) {
+  if (blog?.description) return blog.description;
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  for (const section of sections) {
+    if (section?.textBefore) return section.textBefore;
+    if (section?.textAfter) return section.textAfter;
+  }
+  return blog?.overview || "";
+}
+
+function normalizeImageKind(kind) {
+  return String(kind || "").toLowerCase() === "banner" ? "banner" : "photo";
+}
+
+function resolveBlogImageUrl(url) {
+  const value = String(url || "").trim();
+  if (!value) return "";
+  if (
+    value.startsWith("data:") ||
+    value.startsWith("http://") ||
+    value.startsWith("https://")
+  ) {
+    return value;
+  }
+  if (value.startsWith("/")) {
+    return `${API_BASE}${value}`;
+  }
+  return value;
+}
+
+function getBlogSeoImage(blog) {
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  for (const section of sections) {
+    if (section?.imageDataUrl) return section.imageDataUrl;
+  }
+  return blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
+}
+
 function updateSeoForDetail(blog) {
   const title = `${blog.title} Movie Review & Story | ZyroMovies Blog`;
-  const description = blog.description || blog.overview || `${blog.title} blog`;
-  const image = blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
+  const description = getBlogExcerpt(blog) || `${blog.title} blog`;
+  const image = getBlogSeoImage(blog);
   const canonical = `${window.location.origin}/blog/${encodeURIComponent(blog.slug)}`;
 
   document.title = title;
@@ -71,14 +109,85 @@ function renderBlogList(blogs) {
     const card = document.createElement("a");
     card.className = "blog-card";
     card.href = `blog.html?slug=${encodeURIComponent(blog.slug)}`;
+    const excerpt = getBlogExcerpt(blog).slice(0, 180);
     card.innerHTML = `
       <img class="blog-card-image" src="${blog.bannerUrl || blog.posterUrl || "img/1.jpeg"}" alt="${blog.title || "Blog"}" />
       <div class="blog-card-body">
         <h2 class="blog-card-title">${blog.title || "Untitled"}</h2>
-        <p class="blog-card-text">${(blog.description || blog.overview || "").slice(0, 180)}</p>
+        <p class="blog-card-text">${excerpt}</p>
       </div>
     `;
     listEl.appendChild(card);
+  });
+}
+
+function renderBlogSections(blog) {
+  const sectionsEl = document.getElementById("blog-detail-sections");
+  if (!sectionsEl) return;
+  sectionsEl.innerHTML = "";
+
+  const sections = Array.isArray(blog.sections) ? blog.sections : [];
+  if (!sections.length) return;
+
+  sections.forEach((section, index) => {
+    const textBefore = String(section?.textBefore || "").trim();
+    const textAfter = String(section?.textAfter || "").trim();
+    const imageSrc = resolveBlogImageUrl(
+      section?.imageDataUrl || section?.imageUrl || ""
+    );
+
+    if (!textBefore && !textAfter && !imageSrc) return;
+
+    const block = document.createElement("section");
+    block.className = "blog-content-block";
+
+    const heading = document.createElement("h2");
+    heading.className = "blog-block-label";
+    heading.textContent = `Section ${index + 1}`;
+    block.appendChild(heading);
+
+    if (textBefore) {
+      const beforeWrap = document.createElement("div");
+      beforeWrap.className = "blog-text-block";
+      const beforeLabel = document.createElement("span");
+      beforeLabel.className = "blog-text-block-label";
+      beforeLabel.textContent = "Text before image";
+      const before = document.createElement("p");
+      before.className = "blog-detail-text";
+      before.textContent = textBefore;
+      beforeWrap.appendChild(beforeLabel);
+      beforeWrap.appendChild(before);
+      block.appendChild(beforeWrap);
+    }
+
+    if (imageSrc) {
+      const kind = normalizeImageKind(section.imageKind);
+      const figure = document.createElement("figure");
+      figure.className = `blog-figure blog-figure--${kind}`;
+      const img = document.createElement("img");
+      img.src = imageSrc;
+      img.alt = `${blog.title || "Blog"} - ${kind}`;
+      img.loading = "lazy";
+      img.referrerPolicy = "no-referrer";
+      figure.appendChild(img);
+      block.appendChild(figure);
+    }
+
+    if (textAfter) {
+      const afterWrap = document.createElement("div");
+      afterWrap.className = "blog-text-block";
+      const afterLabel = document.createElement("span");
+      afterLabel.className = "blog-text-block-label";
+      afterLabel.textContent = "Text after image";
+      const after = document.createElement("p");
+      after.className = "blog-detail-text";
+      after.textContent = textAfter;
+      afterWrap.appendChild(afterLabel);
+      afterWrap.appendChild(after);
+      block.appendChild(afterWrap);
+    }
+
+    sectionsEl.appendChild(block);
   });
 }
 
@@ -86,18 +195,20 @@ function renderBlogDetail(blog) {
   const listView = document.getElementById("blog-list-view");
   const detailView = document.getElementById("blog-detail-view");
   const titleEl = document.getElementById("blog-detail-title");
-  const bannerEl = document.getElementById("blog-detail-banner");
+  const introWrap = document.getElementById("blog-detail-intro-wrap");
   const descEl = document.getElementById("blog-detail-description");
-  if (!listView || !detailView || !titleEl || !bannerEl || !descEl) return;
+  if (!listView || !detailView || !titleEl || !descEl) return;
 
   listView.style.display = "none";
   detailView.style.display = "block";
 
   titleEl.textContent = blog.title || "Untitled";
-  bannerEl.src = blog.bannerUrl || blog.posterUrl || "img/1.jpeg";
-  bannerEl.alt = blog.title || "Blog image";
-  descEl.textContent = blog.description || blog.overview || "No description available.";
 
+  const intro = blog.description || "";
+  descEl.textContent = intro;
+  if (introWrap) introWrap.style.display = intro ? "block" : "none";
+
+  renderBlogSections(blog);
   updateSeoForDetail(blog);
 }
 

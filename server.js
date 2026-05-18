@@ -3,17 +3,19 @@ import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import dns from "dns";
+import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: "25mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 // Serve the front-end files from the same folder as server.js
 app.use(express.static(__dirname));
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // ---- Simple in-memory cache (per instance) ----
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
@@ -119,6 +121,16 @@ const bannerSchema = new mongoose.Schema({
   createdAt: Number,
 });
 
+const blogSectionSchema = new mongoose.Schema(
+  {
+    textBefore: { type: String, default: "" },
+    imageDataUrl: { type: String, default: "" },
+    imageKind: { type: String, enum: ["photo", "banner"], default: "photo" },
+    textAfter: { type: String, default: "" },
+  },
+  { _id: false }
+);
+
 const blogSchema = new mongoose.Schema({
   slug: { type: String, unique: true, index: true },
   tmdbId: String,
@@ -126,6 +138,7 @@ const blogSchema = new mongoose.Schema({
   title: String,
   overview: String,
   description: String,
+  sections: [blogSectionSchema],
   posterUrl: String,
   bannerUrl: String,
   createdAt: Number,
@@ -597,27 +610,78 @@ app.delete("/api/banner/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/api/blog", async (req, res) => {
-  const payload = req.body || {};
-  if (!payload.tmdbId || !payload.title) {
-    res.status(400).json({ error: "tmdbId and title are required" });
-    return;
-  }
+app.post("/api/blog/upload-image", async (req, res) => {
+  try {
+    const dataUrl = String(req.body?.dataUrl || "");
+    const match = dataUrl.match(/^data:image\/([\w+.-]+);base64,(.+)$/);
+    if (!match) {
+      res.status(400).json({ error: "Invalid image data" });
+      return;
+    }
 
-  const now = Date.now();
-  const slug = toSlug(payload.title, payload.tmdbId);
-  const blog = await Blog.findOneAndUpdate(
-    { slug },
-    {
-      ...payload,
-      slug,
-      description: String(payload.description || ""),
-      updatedAt: now,
-      createdAt: payload.createdAt || now,
-    },
-    { upsert: true, new: true }
-  );
-  res.json(blog);
+    let ext = match[1].toLowerCase();
+    if (ext === "jpeg") ext = "jpg";
+    if (!["jpg", "png", "webp", "gif"].includes(ext)) ext = "jpg";
+
+    const buffer = Buffer.from(match[2], "base64");
+    if (!buffer.length) {
+      res.status(400).json({ error: "Empty image file" });
+      return;
+    }
+
+    const uploadDir = path.join(__dirname, "uploads", "blog");
+    await fs.mkdir(uploadDir, { recursive: true });
+    const filename = `blog-${Date.now()}-${Math.random().toString(36).slice(2, 9)}.${ext}`;
+    await fs.writeFile(path.join(uploadDir, filename), buffer);
+
+    res.json({ url: `/uploads/blog/${filename}` });
+  } catch (err) {
+    console.error("Blog image upload failed:", err);
+    res.status(500).json({ error: "Failed to upload image" });
+  }
+});
+
+app.post("/api/blog", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    if (!payload.tmdbId || !payload.title) {
+      res.status(400).json({ error: "tmdbId and title are required" });
+      return;
+    }
+
+    const now = Date.now();
+    const slug = toSlug(payload.title, payload.tmdbId);
+    const sections = Array.isArray(payload.sections)
+      ? payload.sections.map((section) => ({
+          textBefore: String(section?.textBefore || ""),
+          imageDataUrl: String(section?.imageDataUrl || section?.imageUrl || ""),
+          imageKind: section?.imageKind === "banner" ? "banner" : "photo",
+          textAfter: String(section?.textAfter || ""),
+        }))
+      : [];
+
+    const blog = await Blog.findOneAndUpdate(
+      { slug },
+      {
+        slug,
+        tmdbId: String(payload.tmdbId),
+        contentType: String(payload.contentType || "movie"),
+        title: String(payload.title),
+        overview: String(payload.overview || ""),
+        description: String(payload.description || ""),
+        sections,
+        posterUrl: String(payload.posterUrl || ""),
+        bannerUrl: String(payload.bannerUrl || ""),
+        updatedAt: now,
+        createdAt: payload.createdAt || now,
+      },
+      { upsert: true, new: true }
+    );
+    res.json(blog);
+  } catch (err) {
+    console.error("Blog save failed:", err);
+    res.status(500).json({ error: "Failed to save blog" });
+  }
 });
 
 app.delete("/api/blog/:id", async (req, res) => {
@@ -652,7 +716,14 @@ app.get("/blog/:slug", async (req, res) => {
     blog.slug
   )}`;
   const pageTitle = `${blog.title} Movie Review & Story | ZyroMovies Blog`;
-  const pageDescription = blog.description || blog.overview || `${blog.title} blog`;
+  const sectionText = Array.isArray(blog.sections)
+    ? blog.sections
+        .map((s) => [s.textBefore, s.textAfter].filter(Boolean).join(" "))
+        .join(" ")
+        .trim()
+    : "";
+  const pageDescription =
+    blog.description || sectionText || blog.overview || `${blog.title} blog`;
   const image = blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
   const jsonLd = {
     "@context": "https://schema.org",

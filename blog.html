@@ -26,8 +26,8 @@
         <h1 class="logo"><a href="index.html" style="color: inherit; text-decoration: none;">ZyroMovies</a></h1>
       </div>
       <div class="blog-nav-links">
-        <a href="index.html" class="admin-back-site-link">Home</a>
-        <a href="blog.html" class="admin-back-site-link">Blog</a>
+        <a href="index.html" class="site-blog-link">Home</a>
+        <a href="blog.html" class="site-blog-link">BLOG</a>
       </div>
     </div>
   </div>
@@ -44,11 +44,18 @@
           &larr; Back to all blogs
         </a>
         <h1 id="blog-detail-title" class="movie-list-title"></h1>
-        <img id="blog-detail-banner" class="blog-detail-banner" src="" alt="" />
-        <p id="blog-detail-description" class="blog-detail-description"></p>
+        <div id="blog-detail-intro-wrap" class="blog-detail-intro-wrap" style="display: none;">
+          <h2 class="blog-block-label">Intro</h2>
+          <p id="blog-detail-description" class="blog-detail-description"></p>
+        </div>
+        <div id="blog-detail-sections" class="blog-detail-sections"></div>
       </article>
     </div>
   </main>
+
+  <footer class="site-footer-nav">
+    <a href="blog.html" class="site-blog-link">BLOG</a>
+  </footer>
 
   <script src="blog.js"></script>
 </body>
