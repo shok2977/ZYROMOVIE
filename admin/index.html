@@ -73,6 +73,9 @@
             <button class="admin-nav-btn" data-section="banners-section">
               Add Banner
             </button>
+            <button class="admin-nav-btn" data-section="blogs-section">
+              Blogs
+            </button>
           </nav>
           <div class="admin-header-actions">
             <a href="../index.html" class="admin-back-site-link">
@@ -288,6 +291,43 @@
             <div id="banners-list" class="admin-table">
               <!-- Filled by JS -->
             </div>
+          </section>
+
+          <section id="blogs-section" class="admin-section">
+            <h2 class="admin-section-title">Create Blog</h2>
+            <p class="admin-help-text">
+              TMDB ID se movie ka title/banner auto fetch hoga. Aap apni custom description add kar sakte hain.
+            </p>
+            <form id="add-blog-form" class="admin-form">
+              <label class="admin-label" for="blog-tmdb-id">TMDB ID</label>
+              <input
+                id="blog-tmdb-id"
+                type="number"
+                class="admin-input"
+                placeholder="e.g. 1311031"
+              />
+
+              <label class="admin-label" for="blog-content-type">Content type</label>
+              <select id="blog-content-type" class="admin-input">
+                <option value="movie">Movie</option>
+                <option value="tv">TV Show</option>
+              </select>
+
+              <label class="admin-label" for="blog-description">Blog Description</label>
+              <textarea
+                id="blog-description"
+                class="admin-input"
+                rows="6"
+                placeholder="Write full blog content here..."
+              ></textarea>
+
+              <button type="submit" class="admin-primary-btn">Publish Blog</button>
+              <p class="admin-error" id="add-blog-error"></p>
+              <p class="admin-success" id="add-blog-success"></p>
+            </form>
+
+            <h3 class="admin-section-subtitle">Existing Blogs</h3>
+            <div id="blogs-list" class="admin-table"></div>
           </section>
 
           <section id="edit-movie-section" class="admin-section">

@@ -119,9 +119,42 @@ const bannerSchema = new mongoose.Schema({
   createdAt: Number,
 });
 
+const blogSchema = new mongoose.Schema({
+  slug: { type: String, unique: true, index: true },
+  tmdbId: String,
+  contentType: String,
+  title: String,
+  overview: String,
+  description: String,
+  posterUrl: String,
+  bannerUrl: String,
+  createdAt: Number,
+  updatedAt: Number,
+});
+
 const Movie = mongoose.model("Movie", movieSchema);
 const List = mongoose.model("List", listSchema);
 const Banner = mongoose.model("Banner", bannerSchema);
+const Blog = mongoose.model("Blog", blogSchema);
+
+function escapeHtml(input) {
+  return String(input || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function toSlug(title, tmdbId) {
+  const base = String(title || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return base ? `${base}-${tmdbId}` : `movie-${tmdbId}`;
+}
 
 // ---- API ----
 
@@ -177,6 +210,28 @@ app.get("/api/data", async (req, res) => {
   const listOrder = lists.map((l) => l.name);
 
   res.json({ movies: moviesByKey, lists: listsByName, listOrder, banners });
+});
+
+app.get("/api/blogs", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.json([]);
+    return;
+  }
+  const blogs = await Blog.find().sort({ createdAt: -1 }).lean();
+  res.json(blogs);
+});
+
+app.get("/api/blog/:slug", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({ error: "Database unavailable" });
+    return;
+  }
+  const blog = await Blog.findOne({ slug: req.params.slug }).lean();
+  if (!blog) {
+    res.status(404).json({ error: "Blog not found" });
+    return;
+  }
+  res.json(blog);
 });
 
 // Fetch VAST tag and return a usable HTML5 mediafile (prefer mp4/progressive)
@@ -542,11 +597,110 @@ app.delete("/api/banner/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/blog", async (req, res) => {
+  const payload = req.body || {};
+  if (!payload.tmdbId || !payload.title) {
+    res.status(400).json({ error: "tmdbId and title are required" });
+    return;
+  }
+
+  const now = Date.now();
+  const slug = toSlug(payload.title, payload.tmdbId);
+  const blog = await Blog.findOneAndUpdate(
+    { slug },
+    {
+      ...payload,
+      slug,
+      description: String(payload.description || ""),
+      updatedAt: now,
+      createdAt: payload.createdAt || now,
+    },
+    { upsert: true, new: true }
+  );
+  res.json(blog);
+});
+
+app.delete("/api/blog/:id", async (req, res) => {
+  await Blog.findByIdAndDelete(req.params.id);
+  res.json({ ok: true });
+});
+
 const PORT = Number(process.env.PORT) || 3001;
 
 // Open the website when someone visits root.
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
+});
+
+app.get("/blog", (req, res) => {
+  res.sendFile(path.join(__dirname, "blog.html"));
+});
+
+app.get("/blog/:slug", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.sendFile(path.join(__dirname, "blog.html"));
+    return;
+  }
+
+  const blog = await Blog.findOne({ slug: req.params.slug }).lean();
+  if (!blog) {
+    res.status(404).sendFile(path.join(__dirname, "blog.html"));
+    return;
+  }
+
+  const canonical = `https://zyromovie.onrender.com/blog/${encodeURIComponent(
+    blog.slug
+  )}`;
+  const pageTitle = `${blog.title} Movie Review & Story | ZyroMovies Blog`;
+  const pageDescription = blog.description || blog.overview || `${blog.title} blog`;
+  const image = blog.bannerUrl || blog.posterUrl || "https://zyromovie.onrender.com/img/1.jpeg";
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "BlogPosting",
+    headline: blog.title,
+    description: pageDescription,
+    image: [image],
+    datePublished: new Date(blog.createdAt || Date.now()).toISOString(),
+    dateModified: new Date(blog.updatedAt || blog.createdAt || Date.now()).toISOString(),
+    mainEntityOfPage: canonical,
+    author: { "@type": "Organization", name: "ZyroMovies" },
+    publisher: { "@type": "Organization", name: "ZyroMovies" },
+  };
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>${escapeHtml(pageTitle)}</title>
+  <meta name="description" content="${escapeHtml(pageDescription)}" />
+  <meta name="robots" content="index,follow" />
+  <link rel="canonical" href="${escapeHtml(canonical)}" />
+  <meta property="og:type" content="article" />
+  <meta property="og:title" content="${escapeHtml(pageTitle)}" />
+  <meta property="og:description" content="${escapeHtml(pageDescription)}" />
+  <meta property="og:url" content="${escapeHtml(canonical)}" />
+  <meta property="og:image" content="${escapeHtml(image)}" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="${escapeHtml(pageTitle)}" />
+  <meta name="twitter:description" content="${escapeHtml(pageDescription)}" />
+  <meta name="twitter:image" content="${escapeHtml(image)}" />
+  <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
+  <script>window.location.replace("/blog.html?slug=${encodeURIComponent(
+    blog.slug
+  )}");</script>
+</head>
+<body>
+  <noscript>
+    <h1>${escapeHtml(blog.title)}</h1>
+    <img src="${escapeHtml(image)}" alt="${escapeHtml(blog.title)}" style="max-width:100%;height:auto;" />
+    <p>${escapeHtml(pageDescription)}</p>
+    <p><a href="/blog.html?slug=${encodeURIComponent(blog.slug)}">Open blog</a></p>
+  </noscript>
+</body>
+</html>`;
+
+  res.send(html);
 });
 
 app.listen(PORT, () => {

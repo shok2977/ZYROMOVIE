@@ -119,6 +119,30 @@ async function deleteBanner(id) {
   return await res.json();
 }
 
+async function addBlog(payload) {
+  const res = await fetch(`${API_BASE}/api/blog`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to add blog");
+  return await res.json();
+}
+
+async function fetchBlogs() {
+  const res = await fetch(`${API_BASE}/api/blogs`);
+  if (!res.ok) throw new Error("Failed to load blogs");
+  return await res.json();
+}
+
+async function deleteBlog(id) {
+  const res = await fetch(`${API_BASE}/api/blog/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("Failed to delete blog");
+  return await res.json();
+}
+
 async function maybeMigrateLocalToApi() {
   // Only migrate when API is empty, so we don't duplicate data.
   const apiMoviesCount = Object.keys(cachedData.movies || {}).length;
@@ -575,6 +599,39 @@ function renderBanners() {
   });
 }
 
+async function renderBlogs() {
+  const blogsListEl = document.getElementById("blogs-list");
+  if (!blogsListEl) return;
+  blogsListEl.innerHTML = "";
+
+  let blogs = [];
+  try {
+    blogs = await fetchBlogs();
+  } catch (e) {
+    blogsListEl.innerHTML =
+      '<p class="admin-empty">Failed to load blogs. Server chal raha hai?</p>';
+    return;
+  }
+
+  if (!blogs.length) {
+    blogsListEl.innerHTML = '<p class="admin-empty">No blogs created yet.</p>';
+    return;
+  }
+
+  blogs.forEach((blog) => {
+    const row = document.createElement("div");
+    row.className = "admin-table-row";
+    row.innerHTML = `
+      <div>${blog.title || "Untitled"}</div>
+      <div>TMDB ${blog.tmdbId || "-"}</div>
+      <div>${(blog.description || "").slice(0, 90)}</div>
+      <div><a href="../blog/${encodeURIComponent(blog.slug)}" target="_blank" rel="noopener noreferrer">Open</a></div>
+      <div><button class="admin-delete-btn" data-blog-id="${blog._id}">Delete</button></div>
+    `;
+    blogsListEl.appendChild(row);
+  });
+}
+
 async function fetchTmdbDetails(tmdbId, type) {
   const base = "https://api.themoviedb.org/3";
   const path =
@@ -590,6 +647,9 @@ async function fetchTmdbDetails(tmdbId, type) {
     overview: data.overview || "",
     posterUrl: data.poster_path
       ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
+      : "",
+    bannerUrl: data.backdrop_path
+      ? `https://image.tmdb.org/t/p/w1280${data.backdrop_path}`
       : "",
   };
 }
@@ -664,6 +724,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderDashboard();
     renderLists();
     renderBanners();
+    await renderBlogs();
   }
 
   if (loginForm) {
@@ -682,6 +743,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderDashboard();
         renderLists();
         renderBanners();
+        await renderBlogs();
       } else if (loginError) {
         loginError.textContent = "Invalid ID or password.";
       }
@@ -737,6 +799,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   );
   const bannerErrorEl = document.getElementById("add-banner-error");
   const bannersListEl = document.getElementById("banners-list");
+  const addBlogForm = document.getElementById("add-blog-form");
+  const addBlogError = document.getElementById("add-blog-error");
+  const addBlogSuccess = document.getElementById("add-blog-success");
+  const blogTmdbInput = document.getElementById("blog-tmdb-id");
+  const blogContentType = document.getElementById("blog-content-type");
+  const blogDescription = document.getElementById("blog-description");
+  const blogsList = document.getElementById("blogs-list");
 
   let currentBannerImageDataUrl = "";
 
@@ -849,6 +918,62 @@ document.addEventListener("DOMContentLoaded", async () => {
         await refreshData();
         renderBanners();
       }
+    });
+  }
+
+  if (addBlogForm) {
+    addBlogForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (addBlogError) addBlogError.textContent = "";
+      if (addBlogSuccess) addBlogSuccess.textContent = "";
+
+      const tmdbId = blogTmdbInput?.value?.trim() || "";
+      const type = blogContentType?.value || "movie";
+      const description = blogDescription?.value?.trim() || "";
+
+      if (!tmdbId) {
+        if (addBlogError) addBlogError.textContent = "TMDB ID is required.";
+        return;
+      }
+      if (!description) {
+        if (addBlogError) addBlogError.textContent = "Description is required.";
+        return;
+      }
+
+      try {
+        const meta = await fetchTmdbDetails(tmdbId, type);
+        await addBlog({
+          tmdbId,
+          contentType: type,
+          title: meta.title,
+          overview: meta.overview,
+          posterUrl: meta.posterUrl,
+          bannerUrl: meta.bannerUrl,
+          description,
+          createdAt: Date.now(),
+        });
+        if (blogTmdbInput) blogTmdbInput.value = "";
+        if (blogDescription) blogDescription.value = "";
+        if (addBlogSuccess) addBlogSuccess.textContent = "Blog published.";
+        await renderBlogs();
+      } catch (err) {
+        console.error(err);
+        if (addBlogError) {
+          addBlogError.textContent = err?.message || "Failed to publish blog.";
+        }
+      }
+    });
+  }
+
+  if (blogsList) {
+    blogsList.addEventListener("click", async (e) => {
+      const target = e.target;
+      const btn = target?.closest ? target.closest("button") : null;
+      if (!btn || !btn.classList.contains("admin-delete-btn")) return;
+      const blogId = btn.getAttribute("data-blog-id");
+      if (!blogId) return;
+      await deleteBlog(blogId);
+      await renderBlogs();
     });
   }
 

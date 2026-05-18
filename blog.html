@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="index, follow" />
+  <meta name="theme-color" content="#151515" />
+  <meta name="description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="ZyroMovies Blog" />
+  <meta property="og:description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
+  <meta property="og:url" content="https://zyromovie.onrender.com/blog" />
+  <meta property="og:image" content="https://zyromovie.onrender.com/img/1.jpeg" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="ZyroMovies Blog" />
+  <meta name="twitter:description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
+  <meta name="twitter:image" content="https://zyromovie.onrender.com/img/1.jpeg" />
+  <link rel="canonical" href="https://zyromovie.onrender.com/blog" />
+  <link rel="stylesheet" href="style.css" />
+  <title>ZyroMovies Blog</title>
+</head>
+<body>
+  <div class="navbar">
+    <div class="navbar-container">
+      <div class="logo-container">
+        <h1 class="logo"><a href="index.html" style="color: inherit; text-decoration: none;">ZyroMovies</a></h1>
+      </div>
+      <div class="blog-nav-links">
+        <a href="index.html" class="admin-back-site-link">Home</a>
+        <a href="blog.html" class="admin-back-site-link">Blog</a>
+      </div>
+    </div>
+  </div>
+
+  <main class="container">
+    <div class="content-container">
+      <section id="blog-list-view">
+        <h1 class="movie-list-title">BLOG</h1>
+        <div id="blog-list" class="blog-grid"></div>
+      </section>
+
+      <article id="blog-detail-view" style="display: none;">
+        <a href="blog.html" class="admin-back-link" style="display: inline-block; margin-bottom: 12px;">
+          &larr; Back to all blogs
+        </a>
+        <h1 id="blog-detail-title" class="movie-list-title"></h1>
+        <img id="blog-detail-banner" class="blog-detail-banner" src="" alt="" />
+        <p id="blog-detail-description" class="blog-detail-description"></p>
+      </article>
+    </div>
+  </main>
+
+  <script src="blog.js"></script>
+</body>
+</html>
