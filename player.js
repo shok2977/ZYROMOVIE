@@ -52,6 +52,24 @@ function resolveAdVideoUrl(url) {
   return `${API_BASE}${path}`;
 }
 
+/** Prefer sound (e.g. user tapped Play). If autoplay policy blocks audio, fall back to muted. */
+async function startAdPlaybackWithSoundOrMuted(videoEl) {
+  try {
+    videoEl.volume = 1;
+    videoEl.muted = false;
+    await videoEl.play();
+    return true;
+  } catch (_) {
+    try {
+      videoEl.muted = true;
+      await videoEl.play();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+}
+
 function getAdPlaybackSrc(ad) {
   const proxied = ad?.media?.playbackUrl;
   if (proxied) {
@@ -402,6 +420,109 @@ function attachAdUi(player, opts) {
   };
 }
 
+/** Local ads: null = no skip button; 0–600 = seconds until skip enabled. */
+function readOptionalSkipOffsetSeconds(obj) {
+  if (!obj) return null;
+  if (obj.allowSkip === false) return null;
+  const hasAllow =
+    obj.allowSkip === true ||
+    obj.skipOffsetSeconds != null ||
+    obj.skipAfterSeconds != null;
+  if (!hasAllow) return null;
+  const raw =
+    obj.skipOffsetSeconds ?? obj.skip_offset_seconds ?? obj.skipAfterSeconds ?? 5;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0 || n > 600) return null;
+  return n;
+}
+
+/** Fixed on screen so native video layer cannot hide the skip control. */
+function attachPrerollSkipControl(box, skipOffset, onSkip) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "zyro-preroll-skip";
+  btn.setAttribute("aria-label", "Skip advertisement");
+  let skipEnabled = skipOffset <= 0;
+  const startedAt = performance.now();
+
+  const syncPosition = () => {
+    const r = box.getBoundingClientRect();
+    btn.style.position = "fixed";
+    btn.style.right = `${Math.max(12, window.innerWidth - r.right + 16)}px`;
+    btn.style.bottom = `${Math.max(12, window.innerHeight - r.bottom + 18)}px`;
+    btn.style.left = "auto";
+    btn.style.top = "auto";
+    btn.style.zIndex = "2147483647";
+    btn.style.padding = "8px 12px";
+    btn.style.borderRadius = "8px";
+    btn.style.border = "1px solid rgba(255,255,255,0.4)";
+    btn.style.background = "rgba(0,0,0,0.72)";
+    btn.style.color = "#fff";
+    btn.style.fontSize = "13px";
+    btn.style.fontWeight = "800";
+    btn.style.cursor = skipEnabled ? "pointer" : "not-allowed";
+    btn.style.pointerEvents = "auto";
+    btn.style.boxShadow = "0 2px 12px rgba(0,0,0,0.45)";
+  };
+
+  const progressSeconds = (videoEl) => {
+    const wall = (performance.now() - startedAt) / 1000;
+    const vt = videoEl?.currentTime || 0;
+    if (videoEl?.readyState >= 2 && vt > 0.15) return vt;
+    return Math.max(vt, wall);
+  };
+
+  const refreshLabel = (videoEl) => {
+    if (skipEnabled) {
+      btn.textContent = "Skip Ad";
+      btn.disabled = false;
+      btn.style.cursor = "pointer";
+      return;
+    }
+    const left = skipOffset - progressSeconds(videoEl);
+    btn.textContent =
+      left <= 0 ? "Skip Ad" : `Skip in ${Math.max(1, Math.ceil(left))}s`;
+    if (left <= 0) {
+      skipEnabled = true;
+      btn.disabled = false;
+      btn.style.cursor = "pointer";
+    } else {
+      btn.disabled = true;
+      btn.style.cursor = "not-allowed";
+    }
+  };
+
+  syncPosition();
+  refreshLabel(null);
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!skipEnabled) return;
+    onSkip();
+  });
+
+  const onResize = () => syncPosition();
+  window.addEventListener("resize", onResize);
+  window.addEventListener("scroll", onResize, true);
+
+  document.body.appendChild(btn);
+
+  return {
+    btn,
+    refresh(videoEl) {
+      syncPosition();
+      refreshLabel(videoEl);
+    },
+    destroy() {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("scroll", onResize, true);
+      try {
+        btn.remove();
+      } catch (_) {}
+    },
+  };
+}
+
 function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
   return new Promise((resolve) => {
     const src = resolveAdVideoUrl(ad?.videoUrl || ad?.src || "");
@@ -413,6 +534,25 @@ function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
     let switched = false;
     let adMaxTimer = null;
     let adStartupFailsafeId = null;
+    let clickLayer = null;
+    let skipControl = null;
+    let skipTickId = null;
+
+    box.style.position = "relative";
+
+    const cleanupClick = () => {
+      try {
+        if (clickLayer) clickLayer.remove();
+      } catch (_) {}
+      if (skipTickId) {
+        clearInterval(skipTickId);
+        skipTickId = null;
+      }
+      try {
+        skipControl?.destroy();
+      } catch (_) {}
+      skipControl = null;
+    };
 
     const safeShowContent = () => {
       if (switched) return;
@@ -424,9 +564,19 @@ function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
         videoEl.removeAttribute("src");
         videoEl.load();
       } catch (_) {}
+      cleanupClick();
       showContent(contentUrl);
       resolve(true);
     };
+
+    const skipOffset = readOptionalSkipOffsetSeconds(ad);
+    if (skipOffset != null) {
+      skipControl = attachPrerollSkipControl(box, skipOffset, () => {
+        cleanupClick();
+        safeShowContent();
+      });
+      skipTickId = setInterval(() => skipControl?.refresh(videoEl), 250);
+    }
 
     const clickThroughUrl =
       typeof ad?.clickThroughUrl === "string" && ad.clickThroughUrl.trim()
@@ -451,17 +601,16 @@ function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
       safeShowContent();
     }, maxAdMs);
 
-    box.style.position = "relative";
     videoEl.style.cursor = clickThroughUrl ? "pointer" : "default";
     videoEl.playsInline = true;
     videoEl.setAttribute("playsinline", "");
-    videoEl.muted = true;
+    videoEl.volume = 1;
+    videoEl.muted = false;
     videoEl.autoplay = true;
     videoEl.controls = false;
     videoEl.preload = "auto";
     videoEl.src = src;
 
-    let clickLayer = null;
     if (clickThroughUrl) {
       clickLayer = document.createElement("button");
       clickLayer.type = "button";
@@ -482,19 +631,18 @@ function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
       videoEl.addEventListener("click", openLink);
     }
 
-    const cleanupClick = () => {
-      try {
-        if (clickLayer) clickLayer.remove();
-      } catch (_) {}
-    };
-
     videoEl.addEventListener(
       "playing",
       () => {
         clearAdFailsafe();
+        skipControl?.refresh(videoEl);
       },
       { once: true }
     );
+
+    videoEl.addEventListener("timeupdate", () => {
+      skipControl?.refresh(videoEl);
+    });
 
     videoEl.addEventListener("ended", () => {
       cleanupClick();
@@ -519,9 +667,8 @@ function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
     const startPlayback = async () => {
       if (playbackStarted) return;
       playbackStarted = true;
-      try {
-        await videoEl.play();
-      } catch (_) {
+      const ok = await startAdPlaybackWithSoundOrMuted(videoEl);
+      if (!ok) {
         cleanupClick();
         clearAdFailsafe();
         if (switched) return;
@@ -742,7 +889,8 @@ function runAdThenContent(url) {
       videoEl.style.cursor = ad.clickThroughUrl ? "pointer" : "default";
       videoEl.playsInline = true;
       videoEl.setAttribute("playsinline", "");
-      videoEl.muted = true;
+      videoEl.volume = 1;
+      videoEl.muted = false;
       videoEl.autoplay = true;
       videoEl.controls = false;
       videoEl.preload = "auto";
@@ -849,11 +997,8 @@ function runAdThenContent(url) {
       const startPlayback = async () => {
         if (playbackStarted) return;
         playbackStarted = true;
-        try {
-          await videoEl.play();
-        } catch (_) {
-          safeShowContent();
-        }
+        const ok = await startAdPlaybackWithSoundOrMuted(videoEl);
+        if (!ok) safeShowContent();
       };
 
       videoEl.addEventListener("canplay", () => startPlayback(), { once: true });

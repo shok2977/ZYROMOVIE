@@ -277,8 +277,41 @@ const localAdSchema = new mongoose.Schema({
   playCount: { type: Number, default: 0 },
   active: { type: Boolean, default: true },
   clickThroughUrl: { type: String, default: "" },
+  /** true = user skip kar sakta hai (skipOffsetSeconds = kitne sec baad) */
+  allowSkip: { type: Boolean, default: false },
+  /** null = skip band; 0–600 = itne second baad skip allowed */
+  skipOffsetSeconds: { type: Number, default: null },
   createdAt: { type: Number, default: () => Date.now() },
 });
+
+function normalizeLocalAdSkipFields(ad) {
+  if (!ad) return { allowSkip: false, skipOffsetSeconds: null };
+  if (ad.allowSkip === true) {
+    const raw = ad.skipOffsetSeconds ?? ad.skipAfterSeconds ?? 5;
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0 && n <= 600) {
+      return {
+        allowSkip: true,
+        skipOffsetSeconds: Math.floor(n),
+      };
+    }
+    return { allowSkip: true, skipOffsetSeconds: 5 };
+  }
+  const legacy = ad.skipOffsetSeconds;
+  if (
+    legacy != null &&
+    legacy !== "" &&
+    Number.isFinite(Number(legacy)) &&
+    Number(legacy) >= 0 &&
+    Number(legacy) <= 600
+  ) {
+    return {
+      allowSkip: true,
+      skipOffsetSeconds: Math.floor(Number(legacy)),
+    };
+  }
+  return { allowSkip: false, skipOffsetSeconds: null };
+}
 
 const Movie = mongoose.model("Movie", movieSchema);
 const List = mongoose.model("List", listSchema);
@@ -1102,17 +1135,25 @@ app.get("/api/local-ads/next", async (req, res) => {
       $expr: { $lt: ["$playCount", "$maxPlays"] },
     },
     { $inc: { playCount: 1 } },
-    { sort: { playCount: 1, createdAt: 1 }, returnDocument: "after" }
+    {
+      sort: { playCount: 1, createdAt: 1 },
+      returnDocument: "after",
+      lean: true,
+    }
   );
   if (!ad?.videoUrl) {
     res.status(204).end();
     return;
   }
+  const skip = normalizeLocalAdSkipFields(ad);
+
   res.json({
     source: "local",
     title: ad.title || "",
     videoUrl: ad.videoUrl,
     clickThroughUrl: ad.clickThroughUrl || "",
+    allowSkip: skip.allowSkip,
+    skipOffsetSeconds: skip.skipOffsetSeconds,
   });
 });
 
@@ -1130,6 +1171,20 @@ app.post("/api/local-ads", async (req, res) => {
       );
       const clickThroughUrl = String(req.body?.clickThroughUrl || "").trim();
       const dataUrl = String(req.body?.videoDataUrl || "");
+
+      const skipMode = String(req.body?.skipMode || "none").toLowerCase();
+      const allowSkip = skipMode === "after";
+      let skipOffsetSeconds = null;
+      if (allowSkip) {
+        const raw = Number(
+          req.body?.skipOffsetSeconds ?? req.body?.skipAfterSeconds ?? 5
+        );
+        if (Number.isFinite(raw) && raw >= 0 && raw <= 600) {
+          skipOffsetSeconds = Math.floor(raw);
+        } else {
+          skipOffsetSeconds = 5;
+        }
+      }
 
       const match = dataUrl.match(/^data:video\/([\w+.-]+);base64,(.+)$/);
       if (!match) {
@@ -1162,6 +1217,8 @@ app.post("/api/local-ads", async (req, res) => {
         playCount: 0,
         active: true,
         clickThroughUrl,
+        allowSkip,
+        skipOffsetSeconds,
         createdAt: Date.now(),
       });
 
@@ -1181,6 +1238,32 @@ app.patch("/api/local-ads/:id", async (req, res) => {
   if (typeof req.body?.active === "boolean") updates.active = req.body.active;
   if (req.body?.maxPlays != null) {
     updates.maxPlays = Math.max(1, Math.floor(Number(req.body.maxPlays) || 1));
+  }
+  if ("skipOffsetSeconds" in (req.body || {})) {
+    const v = req.body.skipOffsetSeconds;
+    if (v === null || v === "" || v === undefined) {
+      updates.skipOffsetSeconds = null;
+    } else {
+      const n = Math.floor(Number(v));
+      if (Number.isFinite(n) && n >= 0 && n <= 600) {
+        updates.skipOffsetSeconds = n;
+      }
+    }
+  }
+  const skipModePatch = String(req.body?.skipMode || "").toLowerCase();
+  if (skipModePatch === "none") {
+    updates.allowSkip = false;
+    updates.skipOffsetSeconds = null;
+  } else if (skipModePatch === "after") {
+    updates.allowSkip = true;
+    const n = Math.floor(
+      Number(req.body?.skipOffsetSeconds ?? req.body?.skipAfterSeconds ?? 5)
+    );
+    updates.skipOffsetSeconds =
+      Number.isFinite(n) && n >= 0 && n <= 600 ? n : 5;
+  } else if (typeof req.body?.allowSkip === "boolean") {
+    updates.allowSkip = req.body.allowSkip;
+    if (!req.body.allowSkip) updates.skipOffsetSeconds = null;
   }
   const ad = await LocalAd.findByIdAndUpdate(req.params.id, updates, {
     returnDocument: "after",

@@ -57,7 +57,13 @@
         object-fit: contain;
         background: #000;
         position: relative;
-        z-index: 1;
+        z-index: 0;
+      }
+      /* Local / HTML5 preroll: skip must paint above native video compositor layer */
+      #player-box .zyro-preroll-skip {
+        position: absolute;
+        z-index: 100;
+        pointer-events: auto;
       }
       /* Video.js + IMA: fill player area (linear + many VPAID creatives) */
       #player-box .video-js {

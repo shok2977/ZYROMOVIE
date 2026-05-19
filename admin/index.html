@@ -334,6 +334,24 @@
                 placeholder="https://example.com"
               />
 
+              <label class="admin-label" for="local-ad-skip-mode">Skip ad</label>
+              <select id="local-ad-skip-mode" class="admin-input">
+                <option value="none">SKIP NOT ALLOWED</option>
+                <option value="after">CHOOSE SKIP TIME</option>
+              </select>
+              <div id="local-ad-skip-seconds-wrap" style="display: none; margin-top: 8px;">
+                <label class="admin-label" for="local-ad-skip-after">Seconds (0 = turant skip jab ad play ho)</label>
+                <input
+                  id="local-ad-skip-after"
+                  type="number"
+                  min="0"
+                  max="600"
+                  value="5"
+                  class="admin-input"
+                />
+                <p class="admin-small">Max 600 seconds (10 min).</p>
+              </div>
+
               <label class="admin-label" for="local-ad-video-file">Video ad (MP4 / WebM, max 80 MB)</label>
               <input
                 id="local-ad-video-file"

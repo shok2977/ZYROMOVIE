@@ -729,6 +729,16 @@ async function renderLocalAds() {
     const remaining = Math.max(0, maxPlays - playCount);
     const exhausted = playCount >= maxPlays;
     const active = ad.active !== false;
+    const hasSkip =
+      ad.allowSkip === true ||
+      (ad.skipOffsetSeconds != null &&
+        ad.skipOffsetSeconds !== "" &&
+        Number.isFinite(Number(ad.skipOffsetSeconds)));
+    const skipSec = hasSkip ? Number(ad.skipOffsetSeconds ?? 5) : 5;
+    const skipLabel = hasSkip
+      ? `Skip: ${skipSec}s baad`
+      : "Skip: band (player par button nahi)";
+    const skipModeVal = hasSkip ? "after" : "none";
     const videoSrc = resolveAdminAssetUrl(ad.videoUrl || "");
 
     const row = document.createElement("div");
@@ -745,7 +755,11 @@ async function renderLocalAds() {
             ${exhausted ? " · <span style='color:#ff9f43'>Limit reached (VAST will run)</span>" : ""}
           </div>
           <div style="color:#9a9a9a;font-size:12px;margin-top:2px;">
-            ${active ? "Active" : "Paused"}${ad.clickThroughUrl ? ` · Click: ${String(ad.clickThroughUrl).slice(0, 40)}` : ""}
+            ${active ? "Active" : "Paused"} · ${skipLabel}${
+              ad.clickThroughUrl
+                ? ` · Click: ${String(ad.clickThroughUrl).slice(0, 40)}`
+                : ""
+            }
           </div>
         </div>
       </div>
@@ -759,6 +773,22 @@ async function renderLocalAds() {
     `;
 
     listEl.appendChild(row);
+
+    const skipSlot = row.children[1];
+    if (skipSlot) {
+      skipSlot.style.display = "flex";
+      skipSlot.style.flexDirection = "column";
+      skipSlot.style.gap = "8px";
+      skipSlot.style.minWidth = "200px";
+      skipSlot.innerHTML = `
+        <select class="admin-input local-ad-skip-mode-edit" data-ad-id="${id}" style="font-size:12px;padding:6px;">
+          <option value="none"${skipModeVal === "none" ? " selected" : ""}>Skip band</option>
+          <option value="after"${skipModeVal === "after" ? " selected" : ""}>Skip allowed</option>
+        </select>
+        <input type="number" class="admin-input local-ad-skip-sec-edit" data-ad-id="${id}" min="0" max="600" value="${skipSec}" style="width:100%;font-size:12px;padding:6px;" />
+        <button type="button" class="admin-secondary-btn local-ad-save-skip-btn" data-ad-id="${id}" style="font-size:12px;">Save skip settings</button>
+      `;
+    }
   });
 }
 
@@ -1443,12 +1473,26 @@ document.addEventListener("DOMContentLoaded", async () => {
   const localAdTitleInput = document.getElementById("local-ad-title");
   const localAdMaxPlaysInput = document.getElementById("local-ad-max-plays");
   const localAdClickUrlInput = document.getElementById("local-ad-click-url");
+  const localAdSkipMode = document.getElementById("local-ad-skip-mode");
+  const localAdSkipSecondsWrap = document.getElementById("local-ad-skip-seconds-wrap");
+  const localAdSkipAfter = document.getElementById("local-ad-skip-after");
   const localAdVideoInput = document.getElementById("local-ad-video-file");
   const localAdErrorEl = document.getElementById("add-local-ad-error");
   const localAdSuccessEl = document.getElementById("add-local-ad-success");
   const localAdUploadStatus = document.getElementById("local-ad-upload-status");
   const localAdSubmitBtn = document.getElementById("local-ad-submit-btn");
   const localAdsListEl = document.getElementById("local-ads-list");
+
+  function syncLocalAdSkipUi() {
+    if (!localAdSkipMode || !localAdSkipSecondsWrap) return;
+    localAdSkipSecondsWrap.style.display =
+      localAdSkipMode.value === "after" ? "block" : "none";
+  }
+
+  if (localAdSkipMode) {
+    localAdSkipMode.addEventListener("change", syncLocalAdSkipUi);
+    syncLocalAdSkipUi();
+  }
 
   if (localAdForm) {
     localAdForm.addEventListener("submit", async (e) => {
@@ -1463,6 +1507,14 @@ document.addEventListener("DOMContentLoaded", async () => {
       );
       const title = localAdTitleInput?.value?.trim() || "";
       const clickThroughUrl = localAdClickUrlInput?.value?.trim() || "";
+      const skipMode = localAdSkipMode?.value === "after" ? "after" : "none";
+      let skipOffsetSeconds = null;
+      if (skipMode === "after") {
+        const sec = Math.floor(Number(localAdSkipAfter?.value) || 0);
+        if (Number.isFinite(sec) && sec >= 0 && sec <= 600) {
+          skipOffsetSeconds = sec;
+        }
+      }
 
       if (!file) {
         if (localAdErrorEl) localAdErrorEl.textContent = "Please choose a video file.";
@@ -1483,11 +1535,14 @@ document.addEventListener("DOMContentLoaded", async () => {
           title,
           maxPlays,
           clickThroughUrl,
+          skipMode,
+          skipOffsetSeconds,
           videoDataUrl,
         });
         if (localAdSuccessEl)
           localAdSuccessEl.textContent = "Local ad uploaded successfully.";
         if (localAdForm) localAdForm.reset();
+        syncLocalAdSkipUi();
         if (localAdUploadStatus) localAdUploadStatus.textContent = "";
         await renderLocalAds();
       } catch (err) {
@@ -1532,6 +1587,32 @@ document.addEventListener("DOMContentLoaded", async () => {
         } catch (err) {
           console.error(err);
           alert(err?.message || "Failed to update local ad.");
+        }
+        return;
+      }
+
+      if (target.classList?.contains("local-ad-save-skip-btn")) {
+        const adId = target.dataset.adId;
+        if (!adId) return;
+        const row = target.closest(".admin-table-row");
+        const mode = row?.querySelector(".local-ad-skip-mode-edit")?.value || "none";
+        const sec = Math.floor(
+          Number(row?.querySelector(".local-ad-skip-sec-edit")?.value) || 0
+        );
+        try {
+          if (mode === "after") {
+            await updateLocalAd(adId, {
+              skipMode: "after",
+              skipOffsetSeconds: Math.min(600, Math.max(0, sec)),
+            });
+          } else {
+            await updateLocalAd(adId, { skipMode: "none" });
+          }
+          await renderLocalAds();
+          alert("Skip settings save ho gayi. Ab player par ad test karo.");
+        } catch (err) {
+          console.error(err);
+          alert(err?.message || "Skip settings save nahi ho saki.");
         }
       }
     });
