@@ -11,7 +11,7 @@ import { fileURLToPath } from "url";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "25mb" }));
+app.use(express.json({ limit: "80mb" }));
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -270,10 +270,21 @@ const blogSchema = new mongoose.Schema({
   updatedAt: Number,
 });
 
+const localAdSchema = new mongoose.Schema({
+  title: { type: String, default: "" },
+  videoUrl: { type: String, required: true },
+  maxPlays: { type: Number, default: 100 },
+  playCount: { type: Number, default: 0 },
+  active: { type: Boolean, default: true },
+  clickThroughUrl: { type: String, default: "" },
+  createdAt: { type: Number, default: () => Date.now() },
+});
+
 const Movie = mongoose.model("Movie", movieSchema);
 const List = mongoose.model("List", listSchema);
 const Banner = mongoose.model("Banner", bannerSchema);
 const Blog = mongoose.model("Blog", blogSchema);
+const LocalAd = mongoose.model("LocalAd", localAdSchema);
 
 function escapeHtml(input) {
   return String(input || "")
@@ -590,6 +601,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     db: mongoose.connection.readyState === 1,
+    features: { localAds: true },
   });
 });
 
@@ -1066,6 +1078,137 @@ app.post("/api/banner", async (req, res) => {
 // Delete banner
 app.delete("/api/banner/:id", async (req, res) => {
   await Banner.findByIdAndDelete(req.params.id);
+  res.json({ ok: true });
+});
+
+// Local video ads (admin upload + player preroll)
+app.get("/api/local-ads", async (req, res) => {
+  if (!mongoose.connection.readyState) {
+    res.json([]);
+    return;
+  }
+  const ads = await LocalAd.find().sort({ createdAt: -1 }).lean();
+  res.json(ads);
+});
+
+app.get("/api/local-ads/next", async (req, res) => {
+  if (!mongoose.connection.readyState) {
+    res.status(204).end();
+    return;
+  }
+  const ad = await LocalAd.findOneAndUpdate(
+    {
+      active: { $ne: false },
+      $expr: { $lt: ["$playCount", "$maxPlays"] },
+    },
+    { $inc: { playCount: 1 } },
+    { sort: { playCount: 1, createdAt: 1 }, returnDocument: "after" }
+  );
+  if (!ad?.videoUrl) {
+    res.status(204).end();
+    return;
+  }
+  res.json({
+    source: "local",
+    title: ad.title || "",
+    videoUrl: ad.videoUrl,
+    clickThroughUrl: ad.clickThroughUrl || "",
+  });
+});
+
+app.post("/api/local-ads", async (req, res) => {
+    try {
+      if (!mongoose.connection.readyState) {
+        res.status(503).json({ error: "Database not connected" });
+        return;
+      }
+
+      const title = String(req.body?.title || "").trim();
+      const maxPlays = Math.max(
+        1,
+        Math.floor(Number(req.body?.maxPlays) || 100)
+      );
+      const clickThroughUrl = String(req.body?.clickThroughUrl || "").trim();
+      const dataUrl = String(req.body?.videoDataUrl || "");
+
+      const match = dataUrl.match(/^data:video\/([\w+.-]+);base64,(.+)$/);
+      if (!match) {
+        res.status(400).json({ error: "Invalid video file. Use MP4 or WebM." });
+        return;
+      }
+
+      let ext = match[1].toLowerCase();
+      if (ext === "x-m4v") ext = "mp4";
+      if (!["mp4", "webm", "mov", "ogv", "m4v"].includes(ext)) ext = "mp4";
+
+      const buffer = Buffer.from(match[2], "base64");
+      const maxBytes = 80 * 1024 * 1024;
+      if (!buffer.length || buffer.length > maxBytes) {
+        res
+          .status(400)
+          .json({ error: "Video empty or too large (max 80 MB)." });
+        return;
+      }
+
+      const uploadDir = path.join(__dirname, "uploads", "local-ads");
+      await fs.mkdir(uploadDir, { recursive: true });
+      const filename = `ad-${Date.now()}-${Math.random().toString(36).slice(2, 9)}.${ext}`;
+      await fs.writeFile(path.join(uploadDir, filename), buffer);
+
+      const ad = await LocalAd.create({
+        title: title || `Local ad ${filename}`,
+        videoUrl: `/uploads/local-ads/${filename}`,
+        maxPlays,
+        playCount: 0,
+        active: true,
+        clickThroughUrl,
+        createdAt: Date.now(),
+      });
+
+      res.json(ad);
+    } catch (err) {
+      console.error("Local ad create failed:", err);
+      res.status(500).json({ error: "Failed to save local ad" });
+    }
+});
+
+app.patch("/api/local-ads/:id", async (req, res) => {
+  if (!mongoose.connection.readyState) {
+    res.status(503).json({ error: "Database not connected" });
+    return;
+  }
+  const updates = {};
+  if (typeof req.body?.active === "boolean") updates.active = req.body.active;
+  if (req.body?.maxPlays != null) {
+    updates.maxPlays = Math.max(1, Math.floor(Number(req.body.maxPlays) || 1));
+  }
+  const ad = await LocalAd.findByIdAndUpdate(req.params.id, updates, {
+    returnDocument: "after",
+  });
+  if (!ad) {
+    res.status(404).json({ error: "Ad not found" });
+    return;
+  }
+  res.json(ad);
+});
+
+app.delete("/api/local-ads/:id", async (req, res) => {
+  if (!mongoose.connection.readyState) {
+    res.status(503).json({ error: "Database not connected" });
+    return;
+  }
+  const ad = await LocalAd.findByIdAndDelete(req.params.id);
+  if (!ad) {
+    res.status(404).json({ error: "Ad not found" });
+    return;
+  }
+  const videoPath = String(ad.videoUrl || "");
+  if (videoPath.startsWith("/uploads/local-ads/")) {
+    const diskPath = path.join(__dirname, videoPath.replace(/^\//, ""));
+    try {
+      await fs.unlink(diskPath);
+    } catch (_) {}
+  }
   res.json({ ok: true });
 });
 

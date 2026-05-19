@@ -41,8 +41,15 @@ function isPlayableVideoAdUrl(url) {
 }
 
 function shouldRunPrerollAds() {
-  if (getQueryParam("noads") === "1") return false;
-  return !!String(getEffectiveVastTagBase() || "").trim();
+  return getQueryParam("noads") !== "1";
+}
+
+function resolveAdVideoUrl(url) {
+  const v = String(url || "").trim();
+  if (!v) return "";
+  if (/^https?:\/\//i.test(v) || v.startsWith("data:")) return v;
+  const path = v.startsWith("/") ? v : `/${v}`;
+  return `${API_BASE}${path}`;
 }
 
 function getAdPlaybackSrc(ad) {
@@ -395,6 +402,162 @@ function attachAdUi(player, opts) {
   };
 }
 
+function playSimpleHtml5Preroll(videoEl, box, contentUrl, ad) {
+  return new Promise((resolve) => {
+    const src = resolveAdVideoUrl(ad?.videoUrl || ad?.src || "");
+    if (!src) {
+      resolve(false);
+      return;
+    }
+
+    let switched = false;
+    let adMaxTimer = null;
+    let adStartupFailsafeId = null;
+
+    const safeShowContent = () => {
+      if (switched) return;
+      switched = true;
+      if (adMaxTimer) clearTimeout(adMaxTimer);
+      if (adStartupFailsafeId) clearTimeout(adStartupFailsafeId);
+      try {
+        videoEl.pause();
+        videoEl.removeAttribute("src");
+        videoEl.load();
+      } catch (_) {}
+      showContent(contentUrl);
+      resolve(true);
+    };
+
+    const clickThroughUrl =
+      typeof ad?.clickThroughUrl === "string" && ad.clickThroughUrl.trim()
+        ? ad.clickThroughUrl.trim()
+        : null;
+
+    adStartupFailsafeId = setTimeout(() => safeShowContent(), 12000);
+    const clearAdFailsafe = () => {
+      if (adStartupFailsafeId) {
+        clearTimeout(adStartupFailsafeId);
+        adStartupFailsafeId = null;
+      }
+    };
+
+    const adDuration =
+      Number.isFinite(Number(ad?.durationSeconds)) && Number(ad.durationSeconds) > 0
+        ? Number(ad.durationSeconds)
+        : 60;
+    const maxAdMs = Math.min((adDuration + 3) * 1000, 90000);
+    adMaxTimer = setTimeout(() => {
+      clearAdFailsafe();
+      safeShowContent();
+    }, maxAdMs);
+
+    box.style.position = "relative";
+    videoEl.style.cursor = clickThroughUrl ? "pointer" : "default";
+    videoEl.playsInline = true;
+    videoEl.setAttribute("playsinline", "");
+    videoEl.muted = true;
+    videoEl.autoplay = true;
+    videoEl.controls = false;
+    videoEl.preload = "auto";
+    videoEl.src = src;
+
+    let clickLayer = null;
+    if (clickThroughUrl) {
+      clickLayer = document.createElement("button");
+      clickLayer.type = "button";
+      clickLayer.setAttribute("aria-label", "Open advertiser");
+      clickLayer.style.position = "absolute";
+      clickLayer.style.inset = "0";
+      clickLayer.style.zIndex = "12";
+      clickLayer.style.background = "transparent";
+      clickLayer.style.border = "0";
+      clickLayer.style.cursor = "pointer";
+      clickLayer.style.padding = "0";
+      clickLayer.style.margin = "0";
+      box.appendChild(clickLayer);
+      const openLink = () => {
+        window.open(clickThroughUrl, "_blank", "noopener,noreferrer");
+      };
+      clickLayer.addEventListener("click", openLink);
+      videoEl.addEventListener("click", openLink);
+    }
+
+    const cleanupClick = () => {
+      try {
+        if (clickLayer) clickLayer.remove();
+      } catch (_) {}
+    };
+
+    videoEl.addEventListener(
+      "playing",
+      () => {
+        clearAdFailsafe();
+      },
+      { once: true }
+    );
+
+    videoEl.addEventListener("ended", () => {
+      cleanupClick();
+      clearAdFailsafe();
+      safeShowContent();
+    });
+    videoEl.addEventListener("error", () => {
+      cleanupClick();
+      clearAdFailsafe();
+      if (switched) return;
+      switched = true;
+      if (adMaxTimer) clearTimeout(adMaxTimer);
+      try {
+        videoEl.pause();
+        videoEl.removeAttribute("src");
+        videoEl.load();
+      } catch (_) {}
+      resolve(false);
+    });
+
+    let playbackStarted = false;
+    const startPlayback = async () => {
+      if (playbackStarted) return;
+      playbackStarted = true;
+      try {
+        await videoEl.play();
+      } catch (_) {
+        cleanupClick();
+        clearAdFailsafe();
+        if (switched) return;
+        switched = true;
+        if (adMaxTimer) clearTimeout(adMaxTimer);
+        try {
+          videoEl.pause();
+          videoEl.removeAttribute("src");
+          videoEl.load();
+        } catch (_) {}
+        resolve(false);
+      }
+    };
+
+    videoEl.addEventListener("canplay", () => startPlayback(), { once: true });
+    videoEl.load();
+    startPlayback();
+  });
+}
+
+async function tryPlayLocalPreroll(videoEl, box, contentUrl) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    const r = await fetch(`${API_BASE}/api/local-ads/next`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return false;
+    const local = await r.json();
+    if (!local?.videoUrl) return false;
+    const played = await playSimpleHtml5Preroll(videoEl, box, contentUrl, local);
+    return played;
+  } catch (_) {
+    return false;
+  }
+}
+
 function runAdThenContent(url) {
   const box = document.getElementById("player-box");
   if (!box) return;
@@ -412,12 +575,6 @@ function runAdThenContent(url) {
   `;
 
   if (!shouldRunPrerollAds()) {
-    showContent(url);
-    return;
-  }
-
-  const vastTagUrl = (_preloadedVast && _preloadedVast.vastTagUrl) || getSessionVastTagUrl();
-  if (!vastTagUrl) {
     showContent(url);
     return;
   }
@@ -483,6 +640,16 @@ function runAdThenContent(url) {
   };
 
   (async () => {
+    const localPlayed = await tryPlayLocalPreroll(videoEl, box, url);
+    if (localPlayed) return;
+
+    const vastTagUrl =
+      (_preloadedVast && _preloadedVast.vastTagUrl) || getSessionVastTagUrl();
+    if (!vastTagUrl) {
+      showContent(url);
+      return;
+    }
+
     adStartupFailsafeId = setTimeout(() => safeShowContent(), 12000);
     const clearAdFailsafe = () => {
       if (adStartupFailsafeId) {

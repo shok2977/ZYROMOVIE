@@ -166,6 +166,59 @@ async function deleteBanner(id) {
   return await res.json();
 }
 
+async function fetchLocalAds() {
+  const res = await fetch(`${API_BASE}/api/local-ads`);
+  if (!res.ok) return [];
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}
+
+async function createLocalAd(payload) {
+  const res = await adminFetch(
+    "/api/local-ads",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    180000
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 404) {
+      throw new Error(
+        "Local ads API nahi mili (404). Terminal me purana server band karke dubara chalao: node server.js — phir http://localhost:3001/admin/ kholo."
+      );
+    }
+    throw new Error(data?.error || `Failed to upload local ad (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+async function updateLocalAd(id, payload) {
+  const res = await fetch(`${API_BASE}/api/local-ads/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error("Failed to update local ad");
+  return res.json();
+}
+
+async function deleteLocalAd(id) {
+  const res = await fetch(`${API_BASE}/api/local-ads/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error("Failed to delete local ad");
+}
+
+function resolveAdminAssetUrl(url) {
+  if (!url) return "";
+  const value = String(url);
+  if (value.startsWith("data:") || value.startsWith("http")) return value;
+  return `${API_BASE}${value}`;
+}
+
 async function uploadBlogImage(dataUrl) {
   const res = await fetch(`${API_BASE}/api/blog/upload-image`, {
     method: "POST",
@@ -655,6 +708,60 @@ function renderBanners() {
   });
 }
 
+async function renderLocalAds() {
+  const listEl = document.getElementById("local-ads-list");
+  if (!listEl) return;
+
+  listEl.innerHTML = '<p class="admin-small">Loading local ads...</p>';
+  const ads = await fetchLocalAds();
+  listEl.innerHTML = "";
+
+  if (!ads.length) {
+    listEl.innerHTML =
+      '<p class="admin-empty">No local ads yet. Upload your first video ad above.</p>';
+    return;
+  }
+
+  ads.forEach((ad) => {
+    const id = ad._id || ad.id;
+    const maxPlays = Math.max(1, Number(ad.maxPlays) || 1);
+    const playCount = Math.max(0, Number(ad.playCount) || 0);
+    const remaining = Math.max(0, maxPlays - playCount);
+    const exhausted = playCount >= maxPlays;
+    const active = ad.active !== false;
+    const videoSrc = resolveAdminAssetUrl(ad.videoUrl || "");
+
+    const row = document.createElement("div");
+    row.className = "admin-table-row";
+    row.style.alignItems = "center";
+
+    row.innerHTML = `
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+        <video src="${videoSrc.replace(/"/g, "&quot;")}" muted playsinline preload="metadata" style="width:160px;height:90px;object-fit:cover;border-radius:8px;background:#111;"></video>
+        <div>
+          <div style="font-weight:700;">${(ad.title || "Local ad").replace(/</g, "&lt;")}</div>
+          <div style="color:#b3b3b3;font-size:12px;margin-top:4px;">
+            Plays: ${playCount} / ${maxPlays} · Remaining: ${remaining}
+            ${exhausted ? " · <span style='color:#ff9f43'>Limit reached (VAST will run)</span>" : ""}
+          </div>
+          <div style="color:#9a9a9a;font-size:12px;margin-top:2px;">
+            ${active ? "Active" : "Paused"}${ad.clickThroughUrl ? ` · Click: ${String(ad.clickThroughUrl).slice(0, 40)}` : ""}
+          </div>
+        </div>
+      </div>
+      <div></div>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+        <button type="button" class="admin-secondary-btn local-ad-toggle-btn" data-ad-id="${id}" data-active="${active ? "1" : "0"}">
+          ${active ? "Pause" : "Resume"}
+        </button>
+        <button type="button" class="admin-delete-btn local-ad-delete-btn" data-ad-id="${id}">Delete</button>
+      </div>
+    `;
+
+    listEl.appendChild(row);
+  });
+}
+
 function getBlogPreviewText(blog) {
   if (blog?.description) return blog.description;
   const sections = Array.isArray(blog?.sections) ? blog.sections : [];
@@ -946,6 +1053,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     renderDashboard();
     renderLists();
     renderBanners();
+    await renderLocalAds();
     await renderBlogs();
   }
 
@@ -965,6 +1073,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         renderDashboard();
         renderLists();
         renderBanners();
+        await renderLocalAds();
         await renderBlogs();
       } else if (loginError) {
         loginError.textContent = "Invalid ID or password.";
@@ -990,6 +1099,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         } catch (err) {
           console.error(err);
         }
+      }
+      if (t === "local-ads-section") {
+        await renderLocalAds();
       }
     });
   });
@@ -1323,6 +1435,104 @@ document.addEventListener("DOMContentLoaded", async () => {
         await deleteBanner(bannerId);
         await refreshData();
         renderBanners();
+      }
+    });
+  }
+
+  const localAdForm = document.getElementById("add-local-ad-form");
+  const localAdTitleInput = document.getElementById("local-ad-title");
+  const localAdMaxPlaysInput = document.getElementById("local-ad-max-plays");
+  const localAdClickUrlInput = document.getElementById("local-ad-click-url");
+  const localAdVideoInput = document.getElementById("local-ad-video-file");
+  const localAdErrorEl = document.getElementById("add-local-ad-error");
+  const localAdSuccessEl = document.getElementById("add-local-ad-success");
+  const localAdUploadStatus = document.getElementById("local-ad-upload-status");
+  const localAdSubmitBtn = document.getElementById("local-ad-submit-btn");
+  const localAdsListEl = document.getElementById("local-ads-list");
+
+  if (localAdForm) {
+    localAdForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (localAdErrorEl) localAdErrorEl.textContent = "";
+      if (localAdSuccessEl) localAdSuccessEl.textContent = "";
+
+      const file = localAdVideoInput?.files?.[0];
+      const maxPlays = Math.max(
+        1,
+        Math.floor(Number(localAdMaxPlaysInput?.value) || 100)
+      );
+      const title = localAdTitleInput?.value?.trim() || "";
+      const clickThroughUrl = localAdClickUrlInput?.value?.trim() || "";
+
+      if (!file) {
+        if (localAdErrorEl) localAdErrorEl.textContent = "Please choose a video file.";
+        return;
+      }
+      if (file.size > 80 * 1024 * 1024) {
+        if (localAdErrorEl)
+          localAdErrorEl.textContent = "Video is too large (max 80 MB).";
+        return;
+      }
+
+      if (localAdSubmitBtn) localAdSubmitBtn.disabled = true;
+      if (localAdUploadStatus) localAdUploadStatus.textContent = "Uploading video...";
+
+      try {
+        const videoDataUrl = await readFileAsDataUrl(file);
+        await createLocalAd({
+          title,
+          maxPlays,
+          clickThroughUrl,
+          videoDataUrl,
+        });
+        if (localAdSuccessEl)
+          localAdSuccessEl.textContent = "Local ad uploaded successfully.";
+        if (localAdForm) localAdForm.reset();
+        if (localAdUploadStatus) localAdUploadStatus.textContent = "";
+        await renderLocalAds();
+      } catch (err) {
+        console.error(err);
+        if (localAdErrorEl) {
+          localAdErrorEl.textContent =
+            err?.message || "Failed to upload local ad.";
+        }
+        if (localAdUploadStatus) localAdUploadStatus.textContent = "";
+      } finally {
+        if (localAdSubmitBtn) localAdSubmitBtn.disabled = false;
+      }
+    });
+  }
+
+  if (localAdsListEl) {
+    localAdsListEl.addEventListener("click", async (e) => {
+      const target = e.target;
+      if (!target) return;
+
+      if (target.classList?.contains("local-ad-delete-btn")) {
+        const adId = target.dataset.adId;
+        if (!adId) return;
+        if (!confirm("Delete this local ad?")) return;
+        try {
+          await deleteLocalAd(adId);
+          await renderLocalAds();
+        } catch (err) {
+          console.error(err);
+          alert(err?.message || "Failed to delete local ad.");
+        }
+        return;
+      }
+
+      if (target.classList?.contains("local-ad-toggle-btn")) {
+        const adId = target.dataset.adId;
+        if (!adId) return;
+        const isActive = target.textContent?.trim() === "Pause";
+        try {
+          await updateLocalAd(adId, { active: !isActive });
+          await renderLocalAds();
+        } catch (err) {
+          console.error(err);
+          alert(err?.message || "Failed to update local ad.");
+        }
       }
     });
   }

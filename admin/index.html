@@ -73,6 +73,9 @@
             <button class="admin-nav-btn" data-section="banners-section">
               Add Banner
             </button>
+            <button class="admin-nav-btn" data-section="local-ads-section">
+              Local Ads
+            </button>
             <button class="admin-nav-btn" data-section="blogs-section">
               Blogs
             </button>
@@ -291,6 +294,64 @@
             <div id="banners-list" class="admin-table">
               <!-- Filled by JS -->
             </div>
+          </section>
+
+          <section id="local-ads-section" class="admin-section">
+            <h2 class="admin-section-title">Local Ads</h2>
+            <p class="admin-help-text">
+              Apna video ad upload karein. Player pehle local ad chalayega; limit khatam hone par
+              VAST ad use hogi. Ek play par sirf ek local ad — uske baad movie.
+            </p>
+
+            <form id="add-local-ad-form" class="admin-form">
+              <label class="admin-label" for="local-ad-title">Ad title (optional)</label>
+              <input
+                id="local-ad-title"
+                type="text"
+                class="admin-input"
+                placeholder="e.g. Summer promo"
+              />
+
+              <label class="admin-label" for="local-ad-max-plays">Kitni baar ad chale (total plays)</label>
+              <input
+                id="local-ad-max-plays"
+                type="number"
+                min="1"
+                class="admin-input"
+                value="100"
+                placeholder="e.g. 100"
+              />
+              <p class="admin-small">
+                Jitna number likhenge utni baar site-wide yeh ad dikhega. Ek user unlimited baar
+                dekh sakta hai, lekin ek baar me sirf ek ad — phir movie.
+              </p>
+
+              <label class="admin-label" for="local-ad-click-url">Click URL (optional)</label>
+              <input
+                id="local-ad-click-url"
+                type="url"
+                class="admin-input"
+                placeholder="https://example.com"
+              />
+
+              <label class="admin-label" for="local-ad-video-file">Video ad (MP4 / WebM, max 80 MB)</label>
+              <input
+                id="local-ad-video-file"
+                type="file"
+                class="admin-input"
+                accept="video/mp4,video/webm,video/quicktime,.mp4,.webm"
+              />
+              <p class="admin-small" id="local-ad-upload-status"></p>
+
+              <button type="submit" class="admin-primary-btn" id="local-ad-submit-btn">
+                Upload Local Ad
+              </button>
+              <p class="admin-error" id="add-local-ad-error"></p>
+              <p class="admin-success" id="add-local-ad-success"></p>
+            </form>
+
+            <h3 class="admin-section-subtitle">Active Local Ads</h3>
+            <div id="local-ads-list" class="admin-table"></div>
           </section>
 
           <section id="blogs-section" class="admin-section">
