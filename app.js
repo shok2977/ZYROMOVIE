@@ -253,57 +253,227 @@ async function renderDynamicLists() {
   }
 }
 
-// SEARCH
+// SEARCH (popup modal — title + tags + overview)
 
-async function performSearch(query) {
-  const trimmed = query.trim().toLowerCase();
-  const resultsContainer = document.getElementById("search-results-container");
-  const resultsList = document.getElementById("search-results");
-  if (!resultsContainer || !resultsList) return;
+function tokenizeSearchQuery(query) {
+  return String(query || "")
+    .trim()
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter((t) => t.length >= 1);
+}
 
-  if (!trimmed) {
-    resultsContainer.style.display = "none";
-    resultsList.innerHTML = "";
-    return;
-  }
+function movieSearchHaystack(movie) {
+  const typeLabel =
+    movie.type === "tv"
+      ? "tv show series"
+      : movie.type === "anime"
+        ? "anime"
+        : movie.type === "animeMovie"
+          ? "anime movie"
+          : "movie";
+  return [
+    movie.title,
+    movie.overview,
+    movie.tags,
+    typeLabel,
+    movie.type,
+    movie.tmdbId,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
 
-  const data = await fetchAllDataPreferApi();
-  const allMovies = Object.entries(data.movies);
-  const matches = allMovies.filter(([key, movie]) => {
-    const title = (movie.title || "").toLowerCase();
-    return title.includes(trimmed);
+function parseMovieTagList(tagsStr) {
+  return String(tagsStr || "")
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function scoreMovieForSearch(movie, tokens) {
+  const title = String(movie.title || "").toLowerCase();
+  const tagsRaw = String(movie.tags || "").toLowerCase();
+  const tagList = parseMovieTagList(movie.tags);
+  const overview = String(movie.overview || "").toLowerCase();
+  const hay = movieSearchHaystack(movie);
+  let score = 0;
+  const fullQ = tokens.join(" ");
+  if (fullQ && title.includes(fullQ)) score += 40;
+  if (fullQ && tagsRaw.includes(fullQ)) score += 35;
+  if (fullQ && overview.includes(fullQ)) score += 22;
+  if (fullQ && hay.includes(fullQ)) score += 10;
+
+  tagList.forEach((tag) => {
+    if (fullQ && (tag === fullQ || tag.includes(fullQ))) score += 38;
+    tokens.forEach((t) => {
+      if (t && (tag === t || tag.includes(t))) score += 18;
+    });
   });
 
-  resultsList.innerHTML = "";
+  tokens.forEach((t) => {
+    if (!t) return;
+    if (title === t) score += 50;
+    else if (title.startsWith(t)) score += 25;
+    else if (title.includes(t)) score += 12;
+    if (overview.includes(t)) score += 6;
+    if (hay.includes(t)) score += 4;
+  });
+  return score;
+}
 
-  if (matches.length === 0) {
-    resultsContainer.style.display = "none";
+function findMovieSearchMatches(moviesObj, query) {
+  const tokens = tokenizeSearchQuery(query);
+  if (!tokens.length) return [];
+  return Object.entries(moviesObj || {})
+    .map(([movieKey, movie]) => ({
+      movieKey,
+      movie,
+      score: scoreMovieForSearch(movie, tokens),
+    }))
+    .filter((row) => row.score > 0)
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        (a.movie.title || "").localeCompare(b.movie.title || "")
+    );
+}
+
+let searchModalBound = false;
+
+function bindSearchModal() {
+  if (searchModalBound) return;
+  const modal = document.getElementById("search-modal");
+  if (!modal) return;
+  searchModalBound = true;
+
+  const close = () => closeSearchModal();
+  document.getElementById("search-modal-close")?.addEventListener("click", close);
+  modal.querySelectorAll("[data-search-close]").forEach((el) => {
+    el.addEventListener("click", close);
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.hidden) closeSearchModal();
+  });
+}
+
+function openSearchModal() {
+  const modal = document.getElementById("search-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  modal.setAttribute("aria-hidden", "false");
+  document.body.classList.add("search-modal-open");
+}
+
+function closeSearchModal() {
+  const modal = document.getElementById("search-modal");
+  if (!modal) return;
+  modal.hidden = true;
+  modal.setAttribute("aria-hidden", "true");
+  document.body.classList.remove("search-modal-open");
+}
+
+function renderSearchModalResults(matches, query) {
+  const resultsEl = document.getElementById("search-modal-results");
+  const emptyEl = document.getElementById("search-modal-empty");
+  const queryEl = document.getElementById("search-modal-query");
+  const titleEl = document.getElementById("search-modal-title");
+  if (!resultsEl) return;
+
+  const q = String(query || "").trim();
+  if (queryEl) {
+    queryEl.textContent = q
+      ? `Results for “${q}” (${matches.length})`
+      : "";
+  }
+  if (titleEl) titleEl.textContent = "Search";
+
+  resultsEl.innerHTML = "";
+
+  if (!matches.length) {
+    if (emptyEl) emptyEl.hidden = false;
     return;
   }
+  if (emptyEl) emptyEl.hidden = true;
 
-  matches.forEach(([movieKey, movie]) => {
-    const item = document.createElement("div");
-    item.className = "movie-list-item";
-    item.dataset.movieKey = movieKey;
-    item.addEventListener("click", () =>
-      navigateToMoviePlayer(movie, movieKey)
-    );
+  matches.forEach(({ movieKey, movie }) => {
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "search-modal-card";
+    card.addEventListener("click", () => {
+      closeSearchModal();
+      navigateToMoviePlayer(movie, movieKey);
+    });
 
     const img = document.createElement("img");
-    img.className = "movie-list-item-img";
+    img.className = "search-modal-card-img";
     img.src = movie.posterUrl || "img/1.jpeg";
     img.alt = movie.title || "";
+    img.loading = "lazy";
 
-    const caption = document.createElement("p");
-    caption.className = "movie-list-item-caption";
-    caption.textContent = movie.title || "Untitled";
+    const meta = document.createElement("div");
+    meta.className = "search-modal-card-meta";
 
-    item.appendChild(img);
-    item.appendChild(caption);
-    resultsList.appendChild(item);
+    const name = document.createElement("h3");
+    name.className = "search-modal-card-title";
+    name.textContent = movie.title || "Untitled";
+
+    const sub = document.createElement("p");
+    sub.className = "search-modal-card-sub";
+    const typeBits =
+      movie.type === "tv"
+        ? "TV"
+        : movie.type === "anime"
+          ? "Anime"
+          : movie.type === "animeMovie"
+            ? "Anime Movie"
+            : "Movie";
+    const tagLine = String(movie.tags || "").trim();
+    sub.textContent = tagLine ? `${typeBits} · ${tagLine}` : typeBits;
+
+    meta.appendChild(name);
+    meta.appendChild(sub);
+    card.appendChild(img);
+    card.appendChild(meta);
+    resultsEl.appendChild(card);
   });
+}
 
-  resultsContainer.style.display = "block";
+async function performSearch(query) {
+  const trimmed = String(query || "").trim();
+  bindSearchModal();
+
+  if (!trimmed) {
+    closeSearchModal();
+    return;
+  }
+
+  openSearchModal();
+  const resultsEl = document.getElementById("search-modal-results");
+  const emptyEl = document.getElementById("search-modal-empty");
+  if (resultsEl) {
+    resultsEl.innerHTML = '<p class="search-modal-loading">Searching…</p>';
+  }
+  if (emptyEl) emptyEl.hidden = true;
+
+  let matches = [];
+  try {
+    const res = await fetch(
+      `${API_BASE}/api/search?q=${encodeURIComponent(trimmed)}`
+    );
+    if (res.ok) {
+      const payload = await res.json();
+      matches = Array.isArray(payload.matches) ? payload.matches : [];
+    }
+  } catch (_) {}
+
+  if (!matches.length) {
+    const data = await fetchAllDataPreferApi();
+    matches = findMovieSearchMatches(data.movies, trimmed);
+  }
+
+  renderSearchModalResults(matches, trimmed);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -327,6 +497,14 @@ document.addEventListener("DOMContentLoaded", () => {
     searchButton.addEventListener("click", () => {
       performSearch(searchInput.value);
     });
+  }
+
+  bindSearchModal();
+
+  const urlQ = new URLSearchParams(window.location.search).get("q");
+  if (urlQ && searchInput) {
+    searchInput.value = urlQ;
+    performSearch(urlQ);
   }
 });
 

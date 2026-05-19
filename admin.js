@@ -848,10 +848,77 @@ function parseTmdbIdInput(raw) {
   return digits ? digits[1] : "";
 }
 
-function tmdbMetaFromPayload(data) {
+function buildTmdbSearchTags(data, keywordNames = []) {
+  const parts = [];
+  if (Array.isArray(data?.genres)) {
+    data.genres.forEach((g) => {
+      if (g?.name) parts.push(String(g.name).trim());
+    });
+  }
+  keywordNames.forEach((k) => {
+    if (k) parts.push(String(k).trim());
+  });
+  if (data?.tagline) parts.push(String(data.tagline).trim());
+  const alt = data?.original_title || data?.original_name;
+  const main = data?.title || data?.name;
+  if (alt && alt !== main) parts.push(String(alt).trim());
+  if (main) parts.push(String(main).trim());
+
+  const seen = new Set();
+  const unique = [];
+  parts.forEach((p) => {
+    const key = p.toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(p);
+  });
+  return unique.join(", ");
+}
+
+async function fetchTmdbKeywordNamesDirect(tmdbId, isMovie) {
+  try {
+    const path = isMovie
+      ? `/movie/${tmdbId}/keywords`
+      : `/tv/${tmdbId}/keywords`;
+    const data = await tmdbDirectGet(path);
+    const list = isMovie ? data?.keywords : data?.results;
+    return (Array.isArray(list) ? list : [])
+      .map((k) => k?.name)
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function fetchTmdbAlternativeTitleNamesDirect(tmdbId, isMovie) {
+  try {
+    const path = isMovie
+      ? `/movie/${tmdbId}/alternative_titles`
+      : `/tv/${tmdbId}/alternative_titles`;
+    const data = await tmdbDirectGet(path);
+    const list = data?.titles || data?.results || [];
+    return (Array.isArray(list) ? list : [])
+      .map((t) => t?.title || t?.name)
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function tmdbMetaFromPayload(data, tmdbId, mediaKind) {
+  const id = String(tmdbId || data?.id || "").trim();
+  const isMovie = mediaKind === "movie" || mediaKind === "animeMovie";
+  const [keywordNames, altTitles] =
+    id && mediaKind
+      ? await Promise.all([
+          fetchTmdbKeywordNamesDirect(id, isMovie),
+          fetchTmdbAlternativeTitleNamesDirect(id, isMovie),
+        ])
+      : [[], []];
   return {
     title: data.title || data.name || "",
     overview: data.overview || "",
+    tags: buildTmdbSearchTags(data, [...keywordNames, ...altTitles]),
     posterUrl: data.poster_path
       ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
       : "",
@@ -903,18 +970,23 @@ async function resolveTmdbMetaDirect(tmdbIdRaw, preferredType = "movie") {
     );
     const movie = found.movie_results?.[0];
     if (movie?.id) {
+      const id = String(movie.id);
+      const data = await tmdbDirectGet(`/movie/${id}`);
       return {
-        tmdbId: String(movie.id),
+        tmdbId: id,
         type: "movie",
-        meta: tmdbMetaFromPayload(movie),
+        meta: await tmdbMetaFromPayload(data, id, "movie"),
       };
     }
     const tv = found.tv_results?.[0];
     if (tv?.id) {
+      const id = String(tv.id);
+      const data = await tmdbDirectGet(`/tv/${id}`);
+      const type = tv.genre_ids?.includes(16) ? "anime" : "tv";
       return {
-        tmdbId: String(tv.id),
-        type: "tv",
-        meta: tmdbMetaFromPayload(tv),
+        tmdbId: id,
+        type,
+        meta: await tmdbMetaFromPayload(data, id, type),
       };
     }
   }
@@ -933,7 +1005,7 @@ async function resolveTmdbMetaDirect(tmdbIdRaw, preferredType = "movie") {
           ? `/movie/${tmdbId}`
           : `/tv/${tmdbId}`;
       const data = await tmdbDirectGet(path);
-      const meta = tmdbMetaFromPayload(data);
+      const meta = await tmdbMetaFromPayload(data, tmdbId, type);
       if (meta.title?.trim()) {
         return { tmdbId, type, meta };
       }
@@ -1829,6 +1901,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         type,
         title: meta.title,
         overview: meta.overview,
+        tags: meta.tags || "",
         posterUrl: meta.posterUrl,
         seasons: seasons.length ? seasons : null,
         sourceKind,
@@ -2264,13 +2337,31 @@ document.addEventListener("DOMContentLoaded", async () => {
       maybeLoadDownloadEpisodes();
     });
   }
-  if (contentTypeSelect) {
-    contentTypeSelect.addEventListener("change", () => {
-      currentDownloadEpisodesTmdb = null;
-      currentDownloadEpisodesSeasons = null;
-      maybeLoadDownloadEpisodes();
-    });
+  async function updateTmdbTagsPreview() {
+    const previewWrap = document.getElementById("tmdb-tags-preview");
+    const previewText = document.getElementById("tmdb-tags-preview-text");
+    if (!previewWrap || !previewText || !tmdbInput) return;
+    const raw = tmdbInput.value?.trim();
+    if (!raw) {
+      previewWrap.style.display = "none";
+      previewText.textContent = "";
+      return;
+    }
+    try {
+      const type = contentTypeSelect?.value || "movie";
+      const hit = await fetchTmdbMetaForAdd(raw, type);
+      const tags = hit?.meta?.tags?.trim();
+      if (tags) {
+        previewText.textContent = tags;
+        previewWrap.style.display = "block";
+      } else {
+        previewWrap.style.display = "none";
+      }
+    } catch (_) {
+      previewWrap.style.display = "none";
+    }
   }
+
   if (tmdbInput) {
     tmdbInput.addEventListener("input", () => {
       if (!sourceKindSelect || sourceKindSelect.value !== "download") return;
@@ -2288,13 +2379,22 @@ document.addEventListener("DOMContentLoaded", async () => {
       scheduleDownloadEpisodesLookup();
     });
     tmdbInput.addEventListener("change", () => {
-      if (!sourceKindSelect || sourceKindSelect.value !== "download") return;
-      scheduleDownloadEpisodesLookup();
+      if (sourceKindSelect?.value === "download") scheduleDownloadEpisodesLookup();
+      updateTmdbTagsPreview();
     });
     tmdbInput.addEventListener("blur", () => {
       currentDownloadEpisodesTmdb = null;
       currentDownloadEpisodesSeasons = null;
       maybeLoadDownloadEpisodes();
+      updateTmdbTagsPreview();
+    });
+  }
+  if (contentTypeSelect) {
+    contentTypeSelect.addEventListener("change", () => {
+      currentDownloadEpisodesTmdb = null;
+      currentDownloadEpisodesSeasons = null;
+      maybeLoadDownloadEpisodes();
+      updateTmdbTagsPreview();
     });
   }
 });

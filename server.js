@@ -50,10 +50,158 @@ function parseTmdbIdInput(raw) {
   return shortDigits ? shortDigits[1] : "";
 }
 
-function tmdbMetaFromPayload(data) {
+function isTmdbMovieKind(type) {
+  return type === "movie" || type === "animeMovie";
+}
+
+function buildTmdbSearchTags(data, keywordNames = []) {
+  const parts = [];
+  if (Array.isArray(data?.genres)) {
+    data.genres.forEach((g) => {
+      if (g?.name) parts.push(String(g.name).trim());
+    });
+  }
+  keywordNames.forEach((k) => {
+    if (k) parts.push(String(k).trim());
+  });
+  if (data?.tagline) parts.push(String(data.tagline).trim());
+  const alt = data?.original_title || data?.original_name;
+  const main = data?.title || data?.name;
+  if (alt && alt !== main) parts.push(String(alt).trim());
+  if (main) parts.push(String(main).trim());
+
+  const seen = new Set();
+  const unique = [];
+  parts.forEach((p) => {
+    const key = p.toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    unique.push(p);
+  });
+  return unique.join(", ");
+}
+
+async function fetchTmdbKeywordNames(tmdbId, isMovie) {
+  try {
+    const path = isMovie
+      ? `/movie/${tmdbId}/keywords`
+      : `/tv/${tmdbId}/keywords`;
+    const data = await tmdbApiGet(path);
+    const list = isMovie ? data?.keywords : data?.results;
+    return (Array.isArray(list) ? list : [])
+      .map((k) => k?.name)
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function fetchTmdbAlternativeTitleNames(tmdbId, isMovie) {
+  try {
+    const path = isMovie
+      ? `/movie/${tmdbId}/alternative_titles`
+      : `/tv/${tmdbId}/alternative_titles`;
+    const data = await tmdbApiGet(path);
+    const list = data?.titles || data?.results || [];
+    return (Array.isArray(list) ? list : [])
+      .map((t) => t?.title || t?.name)
+      .filter(Boolean);
+  } catch (_) {
+    return [];
+  }
+}
+
+async function buildTagsForMovieFromTmdb(tmdbId, type) {
+  const id = String(tmdbId || "").trim();
+  if (!id) return "";
+  const tryMovieFirst = isTmdbMovieKind(type);
+  const order = tryMovieFirst ? [true, false] : [false, true];
+  for (const isMovie of order) {
+    try {
+      const path = isMovie ? `/movie/${id}` : `/tv/${id}`;
+      const data = await tmdbApiGet(path);
+      const [keywordNames, altTitles] = await Promise.all([
+        fetchTmdbKeywordNames(id, isMovie),
+        fetchTmdbAlternativeTitleNames(id, isMovie),
+      ]);
+      return buildTmdbSearchTags(data, [...keywordNames, ...altTitles]);
+    } catch (_) {}
+  }
+  return "";
+}
+
+async function enrichMovieTagsFromTmdb(movie) {
+  const existing = String(movie?.tags || "").trim();
+  if (existing) return existing;
+  const tmdbId = String(movie?.tmdbId || "").trim();
+  if (!tmdbId || !movie?.key) return "";
+  const tags = await buildTagsForMovieFromTmdb(tmdbId, movie.type || "movie");
+  if (tags) {
+    await Movie.updateOne({ key: movie.key }, { $set: { tags } });
+  }
+  return tags;
+}
+
+function parseMovieTagList(tagsStr) {
+  return String(tagsStr || "")
+    .split(",")
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function tokenizeSearchQuery(query) {
+  return String(query || "")
+    .trim()
+    .toLowerCase()
+    .split(/[\s,]+/)
+    .filter((t) => t.length >= 1);
+}
+
+function scoreMovieForSearch(movie, tokens) {
+  const title = String(movie.title || "").toLowerCase();
+  const tagsRaw = String(movie.tags || "").toLowerCase();
+  const tagList = parseMovieTagList(movie.tags);
+  const overview = String(movie.overview || "").toLowerCase();
+  const fullQ = tokens.join(" ");
+  let score = 0;
+
+  if (fullQ && title.includes(fullQ)) score += 40;
+  if (fullQ && tagsRaw.includes(fullQ)) score += 35;
+  if (fullQ && overview.includes(fullQ)) score += 22;
+
+  tagList.forEach((tag) => {
+    if (fullQ && (tag === fullQ || tag.includes(fullQ))) score += 38;
+    tokens.forEach((t) => {
+      if (!t) return;
+      if (tag === t || tag.includes(t)) score += 18;
+    });
+  });
+
+  tokens.forEach((t) => {
+    if (!t) return;
+    if (title === t) score += 50;
+    else if (title.startsWith(t)) score += 25;
+    else if (title.includes(t)) score += 12;
+    if (overview.includes(t)) score += 6;
+  });
+
+  return score;
+}
+
+async function tmdbMetaFromPayload(data, tmdbId, mediaKind) {
+  const id = String(tmdbId || data?.id || "").trim();
+  const isMovie = isTmdbMovieKind(mediaKind);
+  const [keywordNames, altTitles] =
+    id && mediaKind
+      ? await Promise.all([
+          fetchTmdbKeywordNames(id, isMovie),
+          fetchTmdbAlternativeTitleNames(id, isMovie),
+        ])
+      : [[], []];
   return {
     title: data.title || data.name || "",
     overview: data.overview || "",
+    tags: buildTmdbSearchTags(data, [...keywordNames, ...altTitles]),
     posterUrl: data.poster_path
       ? `https://image.tmdb.org/t/p/w500${data.poster_path}`
       : "",
@@ -87,18 +235,23 @@ async function resolveTmdbByImdb(imdbId) {
   );
   const movie = found.movie_results?.[0];
   if (movie?.id) {
+    const id = String(movie.id);
+    const data = await tmdbApiGet(`/movie/${id}`);
     return {
-      tmdbId: String(movie.id),
+      tmdbId: id,
       type: "movie",
-      meta: tmdbMetaFromPayload(movie),
+      meta: await tmdbMetaFromPayload(data, id, "movie"),
     };
   }
   const tv = found.tv_results?.[0];
   if (tv?.id) {
+    const id = String(tv.id);
+    const data = await tmdbApiGet(`/tv/${id}`);
+    const type = tv.genre_ids?.includes(16) ? "anime" : "tv";
     return {
-      tmdbId: String(tv.id),
-      type: tv.genre_ids?.includes(16) ? "anime" : "tv",
-      meta: tmdbMetaFromPayload(tv),
+      tmdbId: id,
+      type,
+      meta: await tmdbMetaFromPayload(data, id, type),
     };
   }
   return null;
@@ -125,7 +278,7 @@ async function resolveTmdbMeta(tmdbIdRaw, preferredType = "movie") {
           ? `/movie/${tmdbId}`
           : `/tv/${tmdbId}`;
       const data = await tmdbApiGet(path);
-      const meta = tmdbMetaFromPayload(data);
+      const meta = await tmdbMetaFromPayload(data, tmdbId, type);
       if (meta.title?.trim()) {
         return { tmdbId, type, meta };
       }
@@ -195,6 +348,9 @@ async function connectMongoWithRetry() {
         serverSelectionTimeoutMS: 15000,
       });
       console.log("✅ MongoDB Connected");
+      backfillMovieTagsInBackground().catch((e) => {
+        console.warn("Tag backfill:", e?.message ?? e);
+      });
       return;
     } catch (err) {
       console.error(
@@ -213,12 +369,33 @@ connectMongoWithRetry().catch((e) => {
   console.error("❌ MongoDB connect routine failed:", e?.message ?? e);
 });
 
+async function backfillMovieTagsInBackground() {
+  if (mongoose.connection.readyState !== 1) return;
+  const movies = await Movie.find({
+    tmdbId: { $exists: true, $nin: ["", null] },
+    $or: [{ tags: { $exists: false } }, { tags: "" }, { tags: null }],
+  }).lean();
+  if (!movies.length) return;
+  console.log(`🏷️ Backfilling search tags for ${movies.length} title(s)...`);
+  for (const m of movies) {
+    try {
+      await enrichMovieTagsFromTmdb(m);
+      await new Promise((r) => setTimeout(r, 220));
+    } catch (e) {
+      console.warn("Tag backfill failed:", m.key, e?.message ?? e);
+    }
+  }
+  console.log("✅ Search tag backfill finished");
+}
+
 const movieSchema = new mongoose.Schema({
   key: String,
   tmdbId: String,
   type: String,
   title: String,
   overview: String,
+  /** Comma-separated — home search by name + tags */
+  tags: { type: String, default: "" },
   posterUrl: String,
   seasons: Array,
   sourceKind: String,
@@ -665,7 +842,7 @@ app.get("/api/tmdb/details", async (req, res) => {
         ? `/movie/${tmdbId}`
         : `/tv/${tmdbId}`;
     const data = await tmdbApiGet(path);
-    res.json(tmdbMetaFromPayload(data));
+    res.json(await tmdbMetaFromPayload(data, tmdbId, type));
   } catch (e) {
     res.status(e?.status === 404 ? 404 : 502).json({
       error: e?.message || "TMDB lookup failed",
@@ -768,6 +945,58 @@ app.get("/api/data", async (req, res) => {
     listOrder,
     banners: bannersWithKeys,
   });
+});
+
+app.get("/api/search", async (req, res) => {
+  const q = String(req.query.q || "").trim();
+  if (!q) {
+    res.json({ matches: [] });
+    return;
+  }
+  if (mongoose.connection.readyState !== 1) {
+    res.json({ matches: [] });
+    return;
+  }
+
+  try {
+    let movies = await Movie.find().lean();
+    const missing = movies.filter(
+      (m) => !String(m.tags || "").trim() && String(m.tmdbId || "").trim()
+    );
+    if (missing.length) {
+      const batch = 6;
+      for (let i = 0; i < missing.length; i += batch) {
+        await Promise.all(
+          missing
+            .slice(i, i + batch)
+            .map((m) => enrichMovieTagsFromTmdb(m).catch(() => ""))
+        );
+      }
+      movies = await Movie.find().lean();
+    }
+
+    const tokens = tokenizeSearchQuery(q);
+    const matches = movies
+      .map((movie) => ({
+        movieKey: movie.key,
+        movie,
+        score: scoreMovieForSearch(movie, tokens),
+      }))
+      .filter((row) => row.score > 0)
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          String(a.movie.title || "").localeCompare(String(b.movie.title || ""))
+      )
+      .slice(0, 60);
+
+    res.json({ matches });
+  } catch (e) {
+    res.status(500).json({
+      error: "Search failed",
+      message: e?.message ?? String(e),
+    });
+  }
 });
 
 app.get("/api/blogs", async (req, res) => {
@@ -1007,9 +1236,18 @@ app.post("/api/movie", async (req, res) => {
     return;
   }
   try {
+    const body = { ...req.body };
+    if (body.tmdbId) {
+      try {
+        body.tags = await buildTagsForMovieFromTmdb(
+          body.tmdbId,
+          body.type || "movie"
+        );
+      } catch (_) {}
+    }
     const movie = await Movie.findOneAndUpdate(
-      { key: req.body.key },
-      req.body,
+      { key: body.key },
+      body,
       { upsert: true, returnDocument: "after" }
     );
     res.json(movie);

@@ -81,7 +81,7 @@
                     type="text"
                     id="search-input"
                      class="search-input"
-                    placeholder="Search movies, anime, shows..."
+                    placeholder="Search..."
                     autocomplete="off"
                 /> 
                 <button id="search-button" class="search-button">
@@ -96,13 +96,7 @@
     <div class="container">
         <div class="content-container">
             <div id="banner-slider-root" class="banner-slider-root" style="display: none;"></div>
-            <div id="search-results-container" class="movie-list-container" style="display: none;">
-                <h1 class="movie-list-title">SEARCH RESULTS</h1>
-                <div class="movie-list-wrapper">
-                    <div id="search-results" class="movie-list">
-                    </div>
-                </div>
-            </div>
+            
             <div id="dynamic-lists-root"></div>
         </div>
     </div>
@@ -110,6 +104,21 @@
     <footer class="site-footer-nav">
         <a href="blog.html" class="site-blog-link">BLOG</a>
     </footer>
+
+    <div id="search-modal" class="search-modal" hidden aria-hidden="true">
+        <div class="search-modal-backdrop" data-search-close></div>
+        <div class="search-modal-panel" role="dialog" aria-modal="true" aria-labelledby="search-modal-title">
+            <div class="search-modal-header">
+                <h2 id="search-modal-title" class="search-modal-title">Search</h2>
+                <button type="button" id="search-modal-close" class="search-modal-close" aria-label="Close search">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <p id="search-modal-query" class="search-modal-query"></p>
+            <div id="search-modal-results" class="search-modal-results"></div>
+            <p id="search-modal-empty" class="search-modal-empty" hidden>No movies found. Try another name or tag.</p>
+        </div>
+    </div>
 
     <script src="api-config.js"></script>
     <script src="app.js"></script>
