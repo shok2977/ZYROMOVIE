@@ -136,9 +136,9 @@
               <strong>Anime, New Releases, Hidden Gems, Best, Top 10</strong>
             </p>
             <p class="admin-help-text">
-              Har list ke saamne <strong>Position #</strong> (1, 2, 3…) set karke
-              <strong>Save list positions</strong> dabayein — home page par wahi order hoga.
-              <strong>Random</strong> lists hamesha sabse niche.
+              Set <strong>Position #</strong> (1, 2, 3…) next to each list, then click
+              <strong>Save list positions</strong> — that order appears on the home page.
+              <strong>Random</strong> rows always stay at the bottom.
             </p>
 
             <div id="lists-table" class="admin-table">
@@ -202,7 +202,7 @@
               </div>
 
               <p class="admin-small" id="tmdb-tags-preview" style="display: none;">
-                Search tags (TMDB se auto): <span id="tmdb-tags-preview-text"></span>
+                Search tags (auto from TMDB): <span id="tmdb-tags-preview-text"></span>
               </p>
 
               <label class="admin-label" for="assign-list">Assign to list</label>
@@ -303,8 +303,8 @@
           <section id="local-ads-section" class="admin-section">
             <h2 class="admin-section-title">Local Ads</h2>
             <p class="admin-help-text">
-              Apna video ad upload karein. Player pehle local ad chalayega; limit khatam hone par
-              VAST ad use hogi. Ek play par sirf ek local ad — uske baad movie.
+              Upload your own video ad. The player runs the local ad first; when the play limit is
+              reached, VAST ads are used. One local ad per play — then the movie.
             </p>
 
             <form id="add-local-ad-form" class="admin-form">
@@ -316,7 +316,7 @@
                 placeholder="e.g. Summer promo"
               />
 
-              <label class="admin-label" for="local-ad-max-plays">Kitni baar ad chale (total plays)</label>
+              <label class="admin-label" for="local-ad-max-plays">How many times the ad may play (site-wide)</label>
               <input
                 id="local-ad-max-plays"
                 type="number"
@@ -326,8 +326,8 @@
                 placeholder="e.g. 100"
               />
               <p class="admin-small">
-                Jitna number likhenge utni baar site-wide yeh ad dikhega. Ek user unlimited baar
-                dekh sakta hai, lekin ek baar me sirf ek ad — phir movie.
+                The ad is shown site-wide that many times in total. A user can watch it many times,
+                but only one ad per play — then the movie.
               </p>
 
               <label class="admin-label" for="local-ad-click-url">Click URL (optional)</label>
@@ -344,7 +344,7 @@
                 <option value="after">CHOOSE SKIP TIME</option>
               </select>
               <div id="local-ad-skip-seconds-wrap" style="display: none; margin-top: 8px;">
-                <label class="admin-label" for="local-ad-skip-after">Seconds (0 = turant skip jab ad play ho)</label>
+                <label class="admin-label" for="local-ad-skip-after">Seconds (0 = skip available as soon as the ad starts)</label>
                 <input
                   id="local-ad-skip-after"
                   type="number"
@@ -379,9 +379,8 @@
           <section id="blogs-section" class="admin-section">
             <h2 class="admin-section-title">Create Blog</h2>
             <p class="admin-help-text">
-              TMDB ID se movie ka title/banner auto fetch hoga. Neeche intro likho, phir jitni
-              baar chaho photo/banner sections add karo — har section me image se pehle aur baad
-              me text likh sakte ho.
+              Title and banner are fetched from the TMDB ID. Write the intro below, then add as many
+              photo/banner sections as you like — each section can have text before and after the image.
             </p>
             <form id="add-blog-form" class="admin-form">
               <label class="admin-label" for="blog-tmdb-id">TMDB ID</label>
@@ -406,7 +405,7 @@
                     id="blog-description"
                     class="admin-input"
                     rows="4"
-                    placeholder="Blog shuru hone se pehle yahan likhein..."
+                    placeholder="Write the opening paragraph here..."
                   ></textarea>
                 </div>
               </div>
@@ -420,7 +419,7 @@
                   placeholder="e.g. infinity castle, demon slayer infinity castle, watch online"
                 />
                 <p class="admin-small">
-                  Comma se alag keywords likhein — jin words pe Google me rank chahiye (jaise infinity castle).
+                  Comma-separated keywords you want to rank for on Google (e.g. infinity castle).
                 </p>
               </div>
 

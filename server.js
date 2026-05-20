@@ -264,7 +264,7 @@ async function resolveTmdbMeta(tmdbIdRaw, preferredType = "movie") {
   const tmdbId = parseTmdbIdInput(tmdbIdRaw);
   if (!tmdbId) {
     const err = new Error(
-      "Galat TMDB ID. Sirf number ya themoviedb.org link paste karein (jaise 550 ya /movie/550-...)."
+      "Invalid TMDB ID. Paste only a number or a themoviedb.org link (e.g. 550 or /movie/550-...)."
     );
     err.status = 400;
     throw err;
@@ -286,7 +286,7 @@ async function resolveTmdbMeta(tmdbIdRaw, preferredType = "movie") {
   }
 
   const err = new Error(
-    `TMDB par ID "${tmdbId}" nahi mila. themoviedb.org par kholo — URL se number copy karein (movie ke liye Movie, TV ke liye TV page).`
+    `TMDB ID "${tmdbId}" not found. Open themoviedb.org — copy the number from the URL (Movie page for films, TV page for series).`
   );
   err.status = 404;
   throw err;
@@ -348,6 +348,9 @@ async function connectMongoWithRetry() {
         serverSelectionTimeoutMS: 15000,
       });
       console.log("✅ MongoDB Connected");
+      ensureListSortOrdersOnce().catch((e) => {
+        console.warn("List sort order backfill:", e?.message ?? e);
+      });
       backfillMovieTagsInBackground().catch((e) => {
         console.warn("Tag backfill:", e?.message ?? e);
       });
@@ -454,9 +457,9 @@ const localAdSchema = new mongoose.Schema({
   playCount: { type: Number, default: 0 },
   active: { type: Boolean, default: true },
   clickThroughUrl: { type: String, default: "" },
-  /** true = user skip kar sakta hai (skipOffsetSeconds = kitne sec baad) */
+  /** true = user can skip (skipOffsetSeconds = seconds before skip is allowed) */
   allowSkip: { type: Boolean, default: false },
-  /** null = skip band; 0–600 = itne second baad skip allowed */
+  /** null = skip off; 0–600 = seconds after start when skip is allowed */
   skipOffsetSeconds: { type: Number, default: null },
   createdAt: { type: Number, default: () => Date.now() },
 });
@@ -721,12 +724,27 @@ function parseVastMediaPayload(xml, wrapperImpressions = []) {
   };
 }
 
-function absSiteUrl(url) {
+function requestSiteOrigin(req) {
+  if (req) {
+    const host = req.get("host");
+    if (host) return `${req.protocol}://${host}`;
+  }
+  return SITE_URL.replace(/\/$/, "");
+}
+
+function absSiteUrl(url, req) {
   const value = String(url || "").trim();
-  if (!value) return `${SITE_URL}/img/1.jpeg`;
+  if (!value) return "";
+  if (value.startsWith("data:")) return value;
   if (value.startsWith("http://") || value.startsWith("https://")) return value;
-  if (value.startsWith("/")) return `${SITE_URL}${value}`;
+  if (value.startsWith("/")) return `${requestSiteOrigin(req)}${value}`;
   return value;
+}
+
+function blogSectionHasImage(section) {
+  return Boolean(
+    String(section?.imageDataUrl || section?.imageUrl || "").trim()
+  );
 }
 
 async function resolveMovieKey(tmdbId, contentType) {
@@ -743,7 +761,7 @@ async function resolveMovieKey(tmdbId, contentType) {
   return type ? `${type}-${id}` : "";
 }
 
-function buildBlogSeoMeta(blog) {
+function buildBlogSeoMeta(blog, req) {
   const sectionText = Array.isArray(blog.sections)
     ? blog.sections
         .map((s) => [s.textBefore, s.textAfter].filter(Boolean).join(" "))
@@ -773,19 +791,34 @@ function buildBlogSeoMeta(blog) {
   ]
     .filter(Boolean)
     .join(", ");
-  const image = absSiteUrl(
-    blog.bannerUrl || blog.posterUrl || `${SITE_URL}/img/1.jpeg`
-  );
+  let image = "";
+  const sections = Array.isArray(blog.sections) ? blog.sections : [];
+  for (const section of sections) {
+    const raw = String(section?.imageDataUrl || section?.imageUrl || "").trim();
+    if (raw) {
+      image = absSiteUrl(raw, req);
+      break;
+    }
+  }
+  if (!image) {
+    image =
+      absSiteUrl(blog.bannerUrl, req) ||
+      absSiteUrl(blog.posterUrl, req) ||
+      `${SITE_URL.replace(/\/$/, "")}/img/1.jpeg`;
+  }
   return { pageTitle, pageDescription, keywords, image, focusPhrase, excerpt };
 }
 
-function renderBlogSectionsHtml(blog) {
+function renderBlogSectionsHtml(blog, req) {
   const sections = Array.isArray(blog.sections) ? blog.sections : [];
   return sections
     .map((section, index) => {
       const textBefore = String(section?.textBefore || "").trim();
       const textAfter = String(section?.textAfter || "").trim();
-      const imageSrc = absSiteUrl(section?.imageDataUrl || section?.imageUrl || "");
+      const rawImage = String(
+        section?.imageDataUrl || section?.imageUrl || ""
+      ).trim();
+      const imageSrc = rawImage ? absSiteUrl(rawImage, req) : "";
       const kind = section?.imageKind === "banner" ? "banner" : "photo";
       if (!textBefore && !textAfter && !imageSrc) return "";
 
@@ -793,8 +826,8 @@ function renderBlogSectionsHtml(blog) {
       if (textBefore) {
         html += `<div class="blog-text-block"><span class="blog-text-block-label">Text before image</span><p class="blog-detail-text">${escapeHtml(textBefore)}</p></div>`;
       }
-      if (section?.imageDataUrl || section?.imageUrl) {
-        html += `<figure class="blog-figure blog-figure--${kind}"><img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(blog.title || "Blog")}" loading="lazy" /></figure>`;
+      if (imageSrc) {
+        html += `<figure class="blog-figure blog-figure--${kind}"><img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(blog.title || "Blog")}" loading="lazy" decoding="async" /></figure>`;
       }
       if (textAfter) {
         html += `<div class="blog-text-block"><span class="blog-text-block-label">Text after image</span><p class="blog-detail-text">${escapeHtml(textAfter)}</p></div>`;
@@ -811,7 +844,7 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     db: mongoose.connection.readyState === 1,
-    features: { localAds: true },
+    features: { localAds: true, listDelete: true },
   });
 });
 
@@ -880,32 +913,32 @@ app.get("/api/tmdb/seasons", async (req, res) => {
   }
 });
 
-// All data for front-end (movies by key, lists by name, banners array)
-app.get("/api/data", async (req, res) => {
-  if (mongoose.connection.readyState !== 1) {
-    res.json({ movies: {}, lists: {}, listOrder: [], banners: [] });
-    return;
-  }
+let homeDataPayloadCache = null;
+let homeDataPayloadCacheAt = 0;
+const HOME_DATA_SERVER_CACHE_MS = 45 * 1000;
 
-  const [movies, listsFromDb, banners] = await Promise.all([
-    Movie.find().lean(),
-    List.find().lean(),
-    Banner.find().lean(),
-  ]);
+function invalidateHomeDataCache() {
+  homeDataPayloadCache = null;
+  homeDataPayloadCacheAt = 0;
+}
 
-  let lists = listsFromDb;
+function movieForHomeClient(doc) {
+  return {
+    key: doc.key,
+    tmdbId: doc.tmdbId,
+    type: doc.type,
+    title: doc.title,
+    overview: doc.overview,
+    tags: doc.tags,
+    posterUrl: doc.posterUrl,
+    sourceKind: doc.sourceKind,
+  };
+}
 
-  const moviesByKey = {};
-  movies.forEach((m) => {
-    moviesByKey[m.key] = m;
-  });
-
-  const listsByName = {};
-  lists.forEach((l) => {
-    listsByName[l.name] = l.movieKeys || [];
-  });
-
-  // Backfill sortOrder for legacy documents (once per doc).
+let listSortOrdersEnsured = false;
+async function ensureListSortOrdersOnce() {
+  if (listSortOrdersEnsured || mongoose.connection.readyState !== 1) return;
+  const lists = await List.find().lean();
   const missingOrder = lists.filter(
     (l) => l.sortOrder == null || l.sortOrder === undefined
   );
@@ -921,14 +954,33 @@ app.get("/api/data", async (req, res) => {
     for (const l of missingOrder) {
       await List.updateOne({ _id: l._id }, { $set: { sortOrder: next++ } });
     }
-    lists = await List.find().lean();
   }
+  listSortOrdersEnsured = true;
+}
 
-  lists.sort(
+async function buildHomeDataPayload() {
+  const [movies, listsFromDb, banners] = await Promise.all([
+    Movie.find().select(
+      "key tmdbId type title overview tags posterUrl sourceKind"
+    ).lean(),
+    List.find().select("name movieKeys sortOrder").lean(),
+    Banner.find().lean(),
+  ]);
+
+  const moviesByKey = {};
+  movies.forEach((m) => {
+    if (m?.key) moviesByKey[m.key] = movieForHomeClient(m);
+  });
+
+  const listsByName = {};
+  const lists = [...listsFromDb].sort(
     (a, b) =>
       (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) ||
       String(a.name).localeCompare(String(b.name))
   );
+  lists.forEach((l) => {
+    listsByName[l.name] = l.movieKeys || [];
+  });
   const listOrder = lists.map((l) => l.name);
 
   const bannersWithKeys = banners.map((b) => {
@@ -939,12 +991,55 @@ app.get("/api/data", async (req, res) => {
     return lean;
   });
 
-  res.json({
+  return {
     movies: moviesByKey,
     lists: listsByName,
     listOrder,
     banners: bannersWithKeys,
-  });
+    dbReady: true,
+  };
+}
+
+// All data for front-end (movies by key, lists by name, banners array)
+app.get("/api/data", async (req, res) => {
+  res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+
+  if (mongoose.connection.readyState !== 1) {
+    res.set("Cache-Control", "no-store");
+    res.json({
+      movies: {},
+      lists: {},
+      listOrder: [],
+      banners: [],
+      dbReady: false,
+    });
+    return;
+  }
+
+  const now = _now();
+  if (
+    homeDataPayloadCache &&
+    now - homeDataPayloadCacheAt < HOME_DATA_SERVER_CACHE_MS
+  ) {
+    res.json(homeDataPayloadCache);
+    return;
+  }
+
+  try {
+    const payload = await buildHomeDataPayload();
+    homeDataPayloadCache = payload;
+    homeDataPayloadCacheAt = now;
+    res.json(payload);
+  } catch (e) {
+    res.status(500).json({
+      movies: {},
+      lists: {},
+      listOrder: [],
+      banners: [],
+      dbReady: false,
+      error: e?.message || "Failed to load data",
+    });
+  }
 });
 
 app.get("/api/search", async (req, res) => {
@@ -1227,7 +1322,7 @@ app.get("/api/vast/debug", async (req, res) => {
 app.post("/api/movie", async (req, res) => {
   if (mongoose.connection.readyState !== 1) {
     res.status(503).json({
-      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
     });
     return;
   }
@@ -1250,6 +1345,7 @@ app.post("/api/movie", async (req, res) => {
       body,
       { upsert: true, returnDocument: "after" }
     );
+    invalidateHomeDataCache();
     res.json(movie);
   } catch (e) {
     res.status(500).json({
@@ -1264,19 +1360,94 @@ app.delete("/api/movie/:key", async (req, res) => {
   const key = req.params.key;
   await Movie.deleteOne({ key });
   await List.updateMany({}, { $pull: { movieKeys: key } });
+  invalidateHomeDataCache();
   res.json({ ok: true });
 });
 
-// Create list (if not exists)
-app.post("/api/list", async (req, res) => {
+function isReservedRandomListName(name) {
+  const t = String(name || "").trim();
+  if (/^Random$/i.test(t)) return true;
+  if (/^Random\s+\d+$/i.test(t)) return true;
+  return false;
+}
+
+async function deleteListByName(name, res) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) {
+    res.status(400).json({ error: "List name is required." });
+    return;
+  }
+  if (isReservedRandomListName(trimmed)) {
+    res.status(400).json({ error: "Random lists cannot be deleted." });
+    return;
+  }
+  try {
+    let result = await List.deleteOne({ name: trimmed });
+    if (!result.deletedCount) {
+      const all = await List.find().lean();
+      const match = all.find(
+        (l) =>
+          String(l.name || "").trim().toLowerCase() === trimmed.toLowerCase()
+      );
+      if (match) {
+        result = await List.deleteOne({ _id: match._id });
+      }
+    }
+    if (!result.deletedCount) {
+      res.status(404).json({
+        error: `List "${trimmed}" was not found in the database. Restart the server and try again.`,
+      });
+      return;
+    }
+    invalidateHomeDataCache();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to delete list",
+      message: e?.message ?? String(e),
+    });
+  }
+}
+
+app.post("/api/list/delete", async (req, res) => {
   if (mongoose.connection.readyState !== 1) {
     res.status(503).json({
-      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
     });
     return;
   }
-  const { name } = req.body;
-  const existing = await List.findOne({ name });
+  await deleteListByName(req.body?.name, res);
+});
+
+app.delete("/api/list/:name", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  await deleteListByName(decodeURIComponent(req.params.name || ""), res);
+});
+
+// Create list (if not exists) — also delete when body.action === "delete"
+app.post("/api/list", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const { name, action } = req.body || {};
+  if (action === "delete" || action === "remove") {
+    await deleteListByName(name, res);
+    return;
+  }
+  const listName = String(name || "").trim();
+  if (!listName) {
+    res.status(400).json({ error: "List name is required." });
+    return;
+  }
+  const existing = await List.findOne({ name: listName });
   if (existing) {
     res.json(existing);
     return;
@@ -1286,10 +1457,11 @@ app.post("/api/list", async (req, res) => {
   ]);
   const nextOrder = (maxAgg[0]?.m ?? 0) + 1;
   const list = await List.create({
-    name,
+    name: listName,
     movieKeys: [],
     sortOrder: nextOrder,
   });
+  invalidateHomeDataCache();
   res.json(list);
 });
 
@@ -1305,6 +1477,7 @@ app.post("/api/lists/reorder", async (req, res) => {
       List.updateOne({ name: listName }, { $set: { sortOrder: i + 1 } })
     )
   );
+  invalidateHomeDataCache();
   res.json({ ok: true });
 });
 
@@ -1312,7 +1485,7 @@ app.post("/api/lists/reorder", async (req, res) => {
 app.post("/api/list/assign", async (req, res) => {
   if (mongoose.connection.readyState !== 1) {
     res.status(503).json({
-      error: "Database not connected. Server restart karein aur MongoDB URI check karein.",
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
     });
     return;
   }
@@ -1327,6 +1500,7 @@ app.post("/api/list/assign", async (req, res) => {
       { $addToSet: { movieKeys: key } },
       { upsert: true, returnDocument: "after" }
     );
+    invalidateHomeDataCache();
     res.json(list);
   } catch (e) {
     res.status(500).json({
@@ -1343,12 +1517,14 @@ app.post("/api/banner", async (req, res) => {
     payload.movieKey = await resolveMovieKey(payload.tmdbId, payload.contentType);
   }
   const banner = await Banner.create(payload);
+  invalidateHomeDataCache();
   res.json(banner);
 });
 
 // Delete banner
 app.delete("/api/banner/:id", async (req, res) => {
   await Banner.findByIdAndDelete(req.params.id);
+  invalidateHomeDataCache();
   res.json({ ok: true });
 });
 
@@ -1677,14 +1853,14 @@ app.get("/blog/:slug", async (req, res) => {
     return;
   }
 
-  const canonical = `${SITE_URL}/blog/${encodeURIComponent(blog.slug)}`;
-  const { pageTitle, pageDescription, keywords, image } = buildBlogSeoMeta(blog);
+  const canonical = `${requestSiteOrigin(req)}/blog/${encodeURIComponent(blog.slug)}`;
+  const { pageTitle, pageDescription, keywords, image } = buildBlogSeoMeta(blog, req);
   const movieKey =
     blog.movieKey || (await resolveMovieKey(blog.tmdbId, blog.contentType));
   const playHref = movieKey
     ? `/player.html?key=${encodeURIComponent(movieKey)}`
     : "/";
-  const sectionsHtml = renderBlogSectionsHtml(blog);
+  const sectionsHtml = renderBlogSectionsHtml(blog, req);
   const intro = String(blog.description || "").trim();
 
   const jsonLd = [
@@ -1768,6 +1944,8 @@ app.get("/blog/:slug", async (req, res) => {
   <footer class="site-footer-nav">
     <a href="/blog.html" class="site-blog-link">BLOG</a>
   </footer>
+  <script src="/api-config.js"></script>
+  <script src="/blog.js"></script>
 </body>
 </html>`;
 

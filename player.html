@@ -79,6 +79,16 @@
       #player-box .ima-ad-container iframe {
         max-width: 100% !important;
       }
+      @media only screen and (max-width: 940px) {
+        #player-box video,
+        #player-box iframe,
+        #player-box .zyro-preroll-video,
+        #player-box .video-js,
+        #player-box .vjs-tech {
+          height: 220px !important;
+          max-height: 56vw;
+        }
+      }
     </style>
     <script type="application/ld+json">
       {
@@ -129,7 +139,7 @@
             controls
             playsinline
             width="100%"
-            height="500"
+            height="220"
           ></video>
         </div>
         <div class="player-audio-boost-wrapper" style="margin-top: 16px; text-align: center;">

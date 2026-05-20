@@ -75,21 +75,50 @@ function normalizeImageKind(kind) {
   return String(kind || "").toLowerCase() === "banner" ? "banner" : "photo";
 }
 
+function getSiteOrigin() {
+  if (API_BASE) return API_BASE.replace(/\/$/, "");
+  if (window.location?.origin && window.location.protocol !== "file:") {
+    return window.location.origin.replace(/\/$/, "");
+  }
+  return SITE_URL.replace(/\/$/, "");
+}
+
 function resolveBlogImageUrl(url) {
   const value = String(url || "").trim();
   if (!value) return "";
   if (value.startsWith("data:")) return value;
   if (value.startsWith("http://") || value.startsWith("https://")) return value;
   const path = value.startsWith("/") ? value : `/${value}`;
-  return API_BASE ? `${API_BASE}${path}` : path;
+  return `${getSiteOrigin()}${path}`;
+}
+
+function getBlogSlugFromLocation() {
+  const fromQuery = new URLSearchParams(window.location.search).get("slug");
+  if (fromQuery) return fromQuery.trim();
+  const match = window.location.pathname.match(/\/blog\/([^/]+)\/?$/i);
+  return match ? decodeURIComponent(match[1]) : "";
 }
 
 function getBlogSeoImage(blog) {
   const sections = Array.isArray(blog?.sections) ? blog.sections : [];
   for (const section of sections) {
-    if (section?.imageDataUrl) return resolveBlogImageUrl(section.imageDataUrl);
+    const raw = String(section?.imageDataUrl || section?.imageUrl || "").trim();
+    if (raw) return resolveBlogImageUrl(raw);
   }
-  return blog.bannerUrl || blog.posterUrl || `${SITE_URL}/img/1.jpeg`;
+  if (blog?.bannerUrl) return resolveBlogImageUrl(blog.bannerUrl);
+  if (blog?.posterUrl) return resolveBlogImageUrl(blog.posterUrl);
+  return `${getSiteOrigin()}/img/1.jpeg`;
+}
+
+function getBlogCardImage(blog) {
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  for (const section of sections) {
+    const raw = String(section?.imageDataUrl || section?.imageUrl || "").trim();
+    if (raw) return resolveBlogImageUrl(raw);
+  }
+  if (blog?.bannerUrl) return resolveBlogImageUrl(blog.bannerUrl);
+  if (blog?.posterUrl) return resolveBlogImageUrl(blog.posterUrl);
+  return "img/1.jpeg";
 }
 
 function buildPlayerUrl(movie, movieKey) {
@@ -105,7 +134,7 @@ function buildPlayerUrl(movie, movieKey) {
         firstSeason.episodes[0] &&
         firstSeason.episodes[0].episode_number) ||
       1;
-    const url = new URL("player-lang.html", window.location.href);
+    const url = new URL("/player-lang.html", window.location.origin);
     url.searchParams.set("key", movieKey);
     url.searchParams.set("season", String(firstSeason.season_number));
     url.searchParams.set("episode", String(firstEp));
@@ -117,13 +146,13 @@ function buildPlayerUrl(movie, movieKey) {
     movie?.sourceKind === "download" &&
     (movie.type === "movie" || movie.type === "animeMovie")
   ) {
-    const url = new URL("player-lang.html", window.location.href);
+    const url = new URL("/player-lang.html", window.location.origin);
     url.searchParams.set("key", movieKey);
     url.searchParams.set("lang", "0");
     return url.toString();
   }
 
-  return `player.html?key=${encodeURIComponent(movieKey)}`;
+  return `/player.html?key=${encodeURIComponent(movieKey)}`;
 }
 
 async function resolvePlayUrl(blog) {
@@ -142,7 +171,7 @@ async function resolvePlayUrl(blog) {
   }
 
   if (preferredKey && blog.tmdbId) {
-    return `player.html?key=${encodeURIComponent(preferredKey)}`;
+    return `/player.html?key=${encodeURIComponent(preferredKey)}`;
   }
 
   return "";
@@ -207,7 +236,7 @@ function renderBlogList(blogs) {
     card.href = `/blog/${encodeURIComponent(blog.slug)}`;
     const excerpt = getBlogExcerpt(blog).slice(0, 180);
     card.innerHTML = `
-      <img class="blog-card-image" src="${blog.bannerUrl || blog.posterUrl || "img/1.jpeg"}" alt="${blog.title || "Blog"}" />
+      <img class="blog-card-image" src="${getBlogCardImage(blog)}" alt="${blog.title || "Blog"}" loading="lazy" />
       <div class="blog-card-body">
         <h2 class="blog-card-title">${blog.title || "Untitled"}</h2>
         <p class="blog-card-text">${excerpt}</p>
@@ -228,9 +257,10 @@ function renderBlogSections(blog) {
   sections.forEach((section, index) => {
     const textBefore = String(section?.textBefore || "").trim();
     const textAfter = String(section?.textAfter || "").trim();
-    const imageSrc = resolveBlogImageUrl(
+    const rawImage = String(
       section?.imageDataUrl || section?.imageUrl || ""
-    );
+    ).trim();
+    const imageSrc = rawImage ? resolveBlogImageUrl(rawImage) : "";
 
     if (!textBefore && !textAfter && !imageSrc) return;
 
@@ -294,35 +324,45 @@ function renderBlogSections(blog) {
 
 async function setupPlayButton(blog) {
   const wrap = document.getElementById("blog-play-wrap");
-  const btn = document.getElementById("blog-play-btn");
-  if (!wrap || !btn) return;
+  const btn =
+    document.getElementById("blog-play-btn") ||
+    document.querySelector(".blog-seo-article .blog-play-btn");
+  if (!btn) return;
 
   const playUrl = await resolvePlayUrl(blog);
   if (!playUrl) {
-    wrap.style.display = "none";
+    if (wrap) wrap.style.display = "none";
+    else btn.style.display = "none";
     return;
   }
 
   btn.href = playUrl;
   btn.textContent = `▶ Watch ${blog.title || "Now"} Online`;
-  wrap.style.display = "block";
+  if (wrap) wrap.style.display = "block";
+  else btn.style.display = "";
 }
 
 function renderBlogDetail(blog) {
   const listView = document.getElementById("blog-list-view");
   const detailView = document.getElementById("blog-detail-view");
-  const titleEl = document.getElementById("blog-detail-title");
+  const titleEl =
+    document.getElementById("blog-detail-title") ||
+    document.querySelector(".blog-seo-article .movie-list-title");
   const introWrap = document.getElementById("blog-detail-intro-wrap");
-  const descEl = document.getElementById("blog-detail-description");
-  if (!listView || !detailView || !titleEl || !descEl) return;
+  const descEl =
+    document.getElementById("blog-detail-description") ||
+    document.querySelector(".blog-detail-description");
+  const sectionsEl = document.getElementById("blog-detail-sections");
 
-  listView.style.display = "none";
-  detailView.style.display = "block";
+  if (!titleEl && !sectionsEl) return;
 
-  titleEl.textContent = blog.title || "Untitled";
+  if (listView) listView.style.display = "none";
+  if (detailView) detailView.style.display = "block";
+
+  if (titleEl) titleEl.textContent = blog.title || "Untitled";
 
   const intro = blog.description || "";
-  descEl.textContent = intro;
+  if (descEl) descEl.textContent = intro;
   if (introWrap) introWrap.style.display = intro ? "block" : "none";
 
   renderBlogSections(blog);
@@ -331,8 +371,7 @@ function renderBlogDetail(blog) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const params = new URLSearchParams(window.location.search);
-  const slug = params.get("slug");
+  const slug = getBlogSlugFromLocation();
 
   try {
     if (slug) {

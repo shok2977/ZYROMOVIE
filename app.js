@@ -13,10 +13,77 @@ const API_BASE =
         return `http://${hostname}:3001`;
       })();
 
+const HOME_DATA_CLIENT_CACHE_KEY = "flakes_home_data_v2";
+const HOME_DATA_CLIENT_CACHE_MS = 5 * 60 * 1000;
+let homeDataInflight = null;
+
 async function fetchAllData() {
   const res = await fetch(`${API_BASE}/api/data`);
   if (!res.ok) throw new Error("Failed to load data");
   return await res.json();
+}
+
+function readHomeDataCache() {
+  try {
+    const raw = sessionStorage.getItem(HOME_DATA_CLIENT_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.ts || Date.now() - parsed.ts > HOME_DATA_CLIENT_CACHE_MS) {
+      return null;
+    }
+    return parsed.data || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function writeHomeDataCache(data) {
+  try {
+    sessionStorage.setItem(
+      HOME_DATA_CLIENT_CACHE_KEY,
+      JSON.stringify({ ts: Date.now(), data })
+    );
+  } catch (_) {}
+}
+
+function normalizeHomeData(data) {
+  return {
+    movies: data?.movies || {},
+    lists: data?.lists || {},
+    banners: data?.banners || [],
+    listOrder: Array.isArray(data?.listOrder) ? data.listOrder : [],
+    dbReady: data?.dbReady !== false,
+  };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchAllDataFromApiWithRetry(maxAttempts = 5) {
+  let last = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      const data = await fetchAllData();
+      last = data;
+      const movieCount = Object.keys(data?.movies || {}).length;
+      if (movieCount > 0 || data?.dbReady === true) return data;
+    } catch (err) {
+      if (attempt === maxAttempts - 1) throw err;
+    }
+    if (attempt < maxAttempts - 1) {
+      await delay(350 * (attempt + 1));
+    }
+  }
+  return (
+    last || {
+      movies: {},
+      lists: {},
+      listOrder: [],
+      banners: [],
+      dbReady: false,
+    }
+  );
 }
 
 // Fallback for current setup (admin still writes to localStorage).
@@ -39,29 +106,52 @@ function loadMovieDataLocal() {
 }
 
 async function fetchAllDataPreferApi() {
-  try {
-    const data = await fetchAllData();
-    if (data?.movies && Object.keys(data.movies).length > 0) {
+  if (homeDataInflight) return homeDataInflight;
+
+  homeDataInflight = (async () => {
+    try {
+      const data = await fetchAllDataFromApiWithRetry();
+      const normalized = normalizeHomeData(data);
+      if (Object.keys(normalized.movies).length > 0) {
+        writeHomeDataCache(normalized);
+        return normalized;
+      }
+    } catch (err) {
+      console.warn("API unavailable:", err);
+    }
+
+    const local = loadMovieDataLocal();
+    if (local?.movies && Object.keys(local.movies).length > 0) {
+      return normalizeHomeData(local);
+    }
+
+    const cached = readHomeDataCache();
+    if (cached?.movies && Object.keys(cached.movies).length > 0) {
+      return normalizeHomeData(cached);
+    }
+
+    try {
+      const data = await fetchAllDataFromApiWithRetry(3);
+      const normalized = normalizeHomeData(data);
+      if (Object.keys(normalized.movies).length > 0) {
+        writeHomeDataCache(normalized);
+      }
+      return normalized;
+    } catch (_) {
       return {
-        movies: data.movies,
-        lists: data.lists || {},
-        banners: data.banners || [],
-        listOrder: Array.isArray(data.listOrder) ? data.listOrder : [],
+        movies: {},
+        lists: {},
+        banners: [],
+        listOrder: [],
+        dbReady: false,
       };
     }
-  } catch (err) {
-    console.warn("API unavailable:", err);
-  }
-
-  const local = loadMovieDataLocal();
-  if (local?.movies && Object.keys(local.movies).length > 0) {
-    return local;
-  }
+  })();
 
   try {
-    return await fetchAllData();
-  } catch (_) {
-    return { movies: {}, lists: {}, banners: [], listOrder: [] };
+    return await homeDataInflight;
+  } finally {
+    homeDataInflight = null;
   }
 }
 
@@ -95,6 +185,48 @@ function chunkArray(arr, size) {
 }
 
 const RANDOM_ROW_SIZE = 10;
+
+function bindMovieItemActivation(item, onActivate) {
+  let touchMoved = false;
+  let touchStartX = 0;
+  let touchStartY = 0;
+
+  item.addEventListener(
+    "touchstart",
+    (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      touchMoved = false;
+      touchStartX = t.clientX;
+      touchStartY = t.clientY;
+    },
+    { passive: true }
+  );
+
+  item.addEventListener(
+    "touchmove",
+    (e) => {
+      const t = e.touches[0];
+      if (!t) return;
+      if (
+        Math.abs(t.clientX - touchStartX) > 10 ||
+        Math.abs(t.clientY - touchStartY) > 10
+      ) {
+        touchMoved = true;
+      }
+    },
+    { passive: true }
+  );
+
+  item.addEventListener("touchend", () => {
+    if (!touchMoved) onActivate();
+  });
+
+  item.addEventListener("click", () => {
+    if ("ontouchstart" in window) return;
+    onActivate();
+  });
+}
 
 function navigateToMoviePlayer(movie, movieKey) {
   if (
@@ -156,9 +288,13 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
     const item = document.createElement("div");
     item.className = "movie-list-item";
     item.dataset.movieKey = movieKey;
-    item.addEventListener("click", () => navigateToMoviePlayer(movie, movieKey));
+    bindMovieItemActivation(item, () =>
+      navigateToMoviePlayer(movie, movieKey)
+    );
     const img = document.createElement("img");
     img.className = "movie-list-item-img";
+    img.loading = "lazy";
+    img.decoding = "async";
     img.src = movie.posterUrl || "img/1.jpeg";
     img.alt = movie.title || "";
 
@@ -178,6 +314,26 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
   });
   rightBtn.addEventListener("click", () => {
     wrapper.scrollBy({ left: 850, behavior: "smooth" });
+  });
+
+  let rowHoverTimer = null;
+  const showRowNav = () => container.classList.add("movie-list-container--nav-visible");
+  const hideRowNav = () => container.classList.remove("movie-list-container--nav-visible");
+
+  container.addEventListener("mouseenter", () => {
+    rowHoverTimer = window.setTimeout(showRowNav, 1200);
+  });
+  container.addEventListener("mouseleave", () => {
+    if (rowHoverTimer) clearTimeout(rowHoverTimer);
+    rowHoverTimer = null;
+    hideRowNav();
+  });
+  container.addEventListener("focusin", () => {
+    if (rowHoverTimer) clearTimeout(rowHoverTimer);
+    showRowNav();
+  });
+  container.addEventListener("focusout", (e) => {
+    if (!container.contains(e.relatedTarget)) hideRowNav();
   });
 
   wrapper.appendChild(listEl);
@@ -206,29 +362,38 @@ function getOrderedCustomListNames(data) {
   return ordered;
 }
 
-async function renderDynamicLists() {
+async function renderDynamicLists(dataIn) {
   const root = document.getElementById("dynamic-lists-root");
   if (!root) return;
 
-  root.innerHTML =
-    '<p class="home-status-msg">Loading movies…</p>';
-
-  let data;
-  try {
-    data = await fetchAllDataPreferApi();
-  } catch (err) {
-    console.error(err);
+  if (!dataIn) {
     root.innerHTML =
-      '<p class="home-status-msg home-status-msg--error">Movies load nahi ho paye. Server chalao: <code>node server.js</code> phir kholo <a href="http://localhost:3001">http://localhost:3001</a></p>';
-    return;
+      '<p class="home-status-msg">Loading movies…</p>';
+  }
+
+  let data = dataIn;
+  if (!data) {
+    try {
+      data = await fetchAllDataPreferApi();
+    } catch (err) {
+      console.error(err);
+      root.innerHTML =
+        '<p class="home-status-msg home-status-msg--error">Could not load movies. Start the server: <code>node server.js</code> then open <a href="http://localhost:3001">http://localhost:3001</a></p>';
+      return;
+    }
   }
 
   const movies = data.movies || {};
   const allKeys = Object.keys(movies);
 
   if (!allKeys.length) {
+    if (data.dbReady === false) {
+      root.innerHTML =
+        '<p class="home-status-msg">Connecting to the library…</p>';
+      return;
+    }
     root.innerHTML =
-      '<p class="home-status-msg">Abhi koi movie library me nahi. Admin panel se titles add karein.</p>';
+      '<p class="home-status-msg">No titles in the library yet. Add titles from the admin panel.</p>';
     return;
   }
 
@@ -476,11 +641,28 @@ async function performSearch(query) {
   renderSearchModalResults(matches, trimmed);
 }
 
-document.addEventListener("DOMContentLoaded", () => {
-  renderDynamicLists().catch(console.error);
+async function initHomePage() {
+  const cached = readHomeDataCache();
+  const hasCached =
+    cached?.movies && Object.keys(cached.movies).length > 0;
 
-  // Render top banner slider (admin-managed)
-  initBannerSlider();
+  if (hasCached) {
+    const cachedNorm = normalizeHomeData(cached);
+    renderDynamicLists(cachedNorm).catch(console.error);
+    initBannerSlider(cachedNorm).catch(console.error);
+  }
+
+  const data = await fetchAllDataPreferApi();
+  const freshCount = Object.keys(data.movies || {}).length;
+
+  if (!hasCached || freshCount > 0 || data.dbReady === true) {
+    await renderDynamicLists(data);
+    await initBannerSlider(data);
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  initHomePage().catch(console.error);
 
   const searchInput = document.getElementById("search-input");
   const searchButton = document.getElementById("search-button");
@@ -508,11 +690,11 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 });
 
-async function initBannerSlider() {
+async function initBannerSlider(dataIn) {
   const root = document.getElementById("banner-slider-root");
   if (!root) return;
 
-  const data = await fetchAllDataPreferApi();
+  const data = dataIn || (await fetchAllDataPreferApi());
   const movies = data.movies || {};
   const banners = Array.isArray(data.banners) ? data.banners : [];
   if (!banners.length) {

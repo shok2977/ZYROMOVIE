@@ -25,13 +25,13 @@ async function adminFetch(path, options = {}, timeoutMs = 90000) {
     return await fetch(url, { ...options, signal: ctrl.signal });
   } catch (err) {
     if (err?.name === "AbortError") {
-      throw new Error("Request bahut der tak chali — dubara try karein.");
+      throw new Error("Request timed out — please try again.");
     }
     const msg = String(err?.message || err);
     if (msg === "Failed to fetch" || /networkerror|load failed/i.test(msg)) {
       const hint = API_BASE || window.location.origin;
       throw new Error(
-        `Server se connect nahi ho paya (${hint}). Terminal me "node server.js" chalao, phir browser me ${hint}/admin/ kholo — file:// se mat kholo.`
+        `Could not connect to the server (${hint}). Run "node server.js" in the terminal, then open ${hint}/admin/ in the browser — do not open via file://.`
       );
     }
     throw err;
@@ -46,7 +46,7 @@ async function refreshData() {
   if (!res.ok) {
     throw new Error(
       payload.error ||
-        `API se data load nahi hua (HTTP ${res.status}). Kholo: ${API_BASE || window.location.origin}/admin/`
+        `Could not load data from the API (HTTP ${res.status}). Open: ${API_BASE || window.location.origin}/admin/`
     );
   }
   cachedData = payload;
@@ -98,7 +98,7 @@ async function upsertMovie(movie) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(
-      data.error || `Movie save failed (HTTP ${res.status}). Server + MongoDB check karein.`
+      data.error || `Movie save failed (HTTP ${res.status}). Check the server and MongoDB connection.`
     );
   }
   return data;
@@ -121,6 +121,31 @@ async function upsertList(name) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.error || `List save failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+async function deleteList(name) {
+  const trimmed = String(name || "").trim();
+  const res = await adminFetch("/api/list", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: trimmed, action: "delete" }),
+  });
+  const raw = await res.text();
+  let data = {};
+  try {
+    data = raw ? JSON.parse(raw) : {};
+  } catch (_) {}
+  if (!res.ok) {
+    const routeMissing =
+      res.status === 404 && !data.error && /cannot post/i.test(raw);
+    throw new Error(
+      data.error ||
+        (routeMissing
+          ? "Server is running old code. Press Ctrl+C in the terminal, then run: node server.js — /api/health should show listDelete: true."
+          : `List delete failed (HTTP ${res.status})`)
+    );
   }
   return data;
 }
@@ -187,7 +212,7 @@ async function createLocalAd(payload) {
   if (!res.ok) {
     if (res.status === 404) {
       throw new Error(
-        "Local ads API nahi mili (404). Terminal me purana server band karke dubara chalao: node server.js — phir http://localhost:3001/admin/ kholo."
+        "Local ads API not found (404). Stop the old server and run: node server.js — then open http://localhost:3001/admin/"
       );
     }
     throw new Error(data?.error || `Failed to upload local ad (HTTP ${res.status})`);
@@ -559,7 +584,7 @@ function renderLists() {
   note.className = "admin-help-text";
   note.style.marginBottom = "12px";
   note.textContent =
-    'Home page par "Random" / "Random 2" … hamesha sabse niche dikhti hain — saari titles wahan (10 per row, shuffle). Neeche se number set karein: 1 = sabse upar wali list (Random ke upar).';
+    '"Random" / "Random 2" … always appear at the bottom of the home page — all titles there (10 per row, shuffled). Set numbers below: 1 = top list (above Random rows).';
   listsTable.appendChild(note);
 
   const listNames = getOrderedCustomListNames(data);
@@ -567,7 +592,7 @@ function renderLists() {
     const empty = document.createElement("p");
     empty.className = "admin-empty";
     empty.textContent =
-      'No custom lists yet. Upar "New list" se banayein (jaise Anime, Best) — phir title add karein.';
+      'No custom lists yet. Create one above with "New list" (e.g. Anime, Best) — then add titles.';
     listsTable.appendChild(empty);
     return;
   }
@@ -576,7 +601,7 @@ function renderLists() {
   table.className = "admin-table-inner admin-lists-order-table";
   const header = document.createElement("div");
   header.className = "admin-table-row admin-table-header";
-  header.innerHTML = `<div>Position #</div><div>List name</div><div>Titles</div>`;
+  header.innerHTML = `<div>Position #</div><div>List name</div><div>Titles</div><div>Actions</div>`;
   table.appendChild(header);
 
   listNames.forEach((name, idx) => {
@@ -601,9 +626,33 @@ function renderLists() {
     const countCell = document.createElement("div");
     countCell.textContent = String(count);
 
+    const actionCell = document.createElement("div");
+    const delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "admin-delete-btn";
+    delBtn.textContent = "Delete";
+    delBtn.addEventListener("click", async () => {
+      const msg =
+        count > 0
+          ? `Delete list "${name}"? Its ${count} title(s) will stay on the site — only the list is removed.`
+          : `Delete list "${name}"?`;
+      if (!confirm(msg)) return;
+      try {
+        await deleteList(name);
+        await refreshData();
+        renderLists();
+        renderDashboard();
+      } catch (e) {
+        console.error(e);
+        alert(e?.message || "Could not delete list.");
+      }
+    });
+    actionCell.appendChild(delBtn);
+
     row.appendChild(posCell);
     row.appendChild(nameCell);
     row.appendChild(countCell);
+    row.appendChild(actionCell);
     table.appendChild(row);
   });
   listsTable.appendChild(table);
@@ -631,10 +680,10 @@ function renderLists() {
       await reorderListsApi(order);
       await refreshData();
       renderLists();
-      alert("List order save ho gaya.");
+      alert("List order saved.");
     } catch (e) {
       console.error(e);
-      alert("Order save nahi ho saka. Server chal raha hai?");
+      alert("Could not save order. Is the server running?");
     }
   });
   listsTable.appendChild(saveOrderBtn);
@@ -736,8 +785,8 @@ async function renderLocalAds() {
         Number.isFinite(Number(ad.skipOffsetSeconds)));
     const skipSec = hasSkip ? Number(ad.skipOffsetSeconds ?? 5) : 5;
     const skipLabel = hasSkip
-      ? `Skip: ${skipSec}s baad`
-      : "Skip: band (player par button nahi)";
+      ? `Skip: after ${skipSec}s`
+      : "Skip: off (no button on player)";
     const skipModeVal = hasSkip ? "after" : "none";
     const videoSrc = resolveAdminAssetUrl(ad.videoUrl || "");
 
@@ -812,7 +861,7 @@ async function renderBlogs() {
     blogs = await fetchBlogs();
   } catch (e) {
     blogsListEl.innerHTML =
-      '<p class="admin-empty">Failed to load blogs. Server chal raha hai?</p>';
+      '<p class="admin-empty">Failed to load blogs. Is the server running?</p>';
     return;
   }
 
@@ -952,7 +1001,7 @@ async function tmdbDirectGet(pathAndQuery) {
   if (!res.ok) {
     if (res.status === 401) {
       throw new Error(
-        "TMDB API key invalid hai. themoviedb.org → Settings → API se naya key banao aur admin.js me lagao."
+        "Invalid TMDB API key. Create a new key at themoviedb.org → Settings → API and set it in admin.js."
       );
     }
     const err = new Error(`TMDB error ${res.status}`);
@@ -994,7 +1043,7 @@ async function resolveTmdbMetaDirect(tmdbIdRaw, preferredType = "movie") {
   const tmdbId = parseTmdbIdInput(raw);
   if (!tmdbId) {
     throw new Error(
-      "Galat TMDB ID. Number (550) ya themoviedb.org ka poora link paste karein."
+      "Invalid TMDB ID. Paste a number (550) or a full themoviedb.org link."
     );
   }
 
@@ -1013,13 +1062,41 @@ async function resolveTmdbMetaDirect(tmdbIdRaw, preferredType = "movie") {
   }
 
   throw new Error(
-    `TMDB par ID "${tmdbId}" nahi mila. themoviedb.org par us title ki page kholo — URL me /movie/ ya /tv/ ke baad wala number copy karein.`
+    `TMDB ID "${tmdbId}" not found. Open that title on themoviedb.org — copy the number after /movie/ or /tv/ in the URL.`
   );
 }
 
 async function fetchTmdbDetails(tmdbId, type) {
-  const resolved = await resolveTmdbMetaDirect(String(tmdbId), type);
-  return resolved.meta;
+  const id = String(tmdbId || "").trim();
+  const preferred = String(type || "movie").trim();
+  try {
+    const resolved = await resolveTmdbMetaDirect(id, preferred);
+    return resolved.meta;
+  } catch (_) {
+    try {
+      const q = new URLSearchParams({ tmdbId: id, type: preferred });
+      const res = await adminFetch(`/api/tmdb/resolve?${q}`);
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data?.meta?.title) return data.meta;
+    } catch (_) {}
+  }
+
+  const movies = loadMovieData()?.movies || {};
+  const fromLibrary = Object.values(movies).find(
+    (m) => String(m?.tmdbId || "") === id
+  );
+  if (fromLibrary?.title) {
+    return {
+      title: fromLibrary.title || "",
+      overview: fromLibrary.overview || "",
+      posterUrl: fromLibrary.posterUrl || "",
+      bannerUrl: fromLibrary.bannerUrl || "",
+      tags: fromLibrary.tags || "",
+    };
+  }
+  throw new Error(
+    "TMDB is unreachable right now and this title is not in your library. Add the movie first, or try blog publish again later."
+  );
 }
 
 async function fetchTmdbMetaForAdd(tmdbIdRaw, preferredType) {
@@ -1057,7 +1134,7 @@ function populateAssignListSelect(data) {
   if (!listNames.length) {
     const opt = document.createElement("option");
     opt.value = "";
-    opt.textContent = "Pehle Lists tab se list banayein (Anime, Best, …)";
+    opt.textContent = "Create a list in the Lists tab first (Anime, Best, …)";
     select.appendChild(opt);
     return false;
   }
@@ -1216,7 +1293,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!name) return;
       if (isReservedRandomListName(name)) {
         alert(
-          'Yeh naam reserved hai. "Random" lists home page par automatic banti hain — koi aur naam use karein.'
+          'This name is reserved. "Random" lists are created automatically on the home page — use a different name.'
         );
         return;
       }
@@ -1317,7 +1394,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       </div>
       <div class="blog-field-group">
         <label class="admin-label" for="${beforeId}">1. Text before image</label>
-        <textarea id="${beforeId}" class="admin-input blog-section-before" rows="4" placeholder="Image se pehle likhein..."></textarea>
+        <textarea id="${beforeId}" class="admin-input blog-section-before" rows="4" placeholder="Write text before the image..."></textarea>
       </div>
 
       <div class="blog-field-row">
@@ -1341,7 +1418,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       <div class="blog-field-group">
         <label class="admin-label" for="${afterId}">4. Text after image</label>
-        <textarea id="${afterId}" class="admin-input blog-section-after" rows="4" placeholder="Image ke baad likhein..."></textarea>
+        <textarea id="${afterId}" class="admin-input blog-section-after" rows="4" placeholder="Write text after the image..."></textarea>
       </div>
     `;
 
@@ -1369,17 +1446,16 @@ document.addEventListener("DOMContentLoaded", async () => {
           try {
             imageRef = await uploadBlogImage(dataUrl);
           } catch (uploadErr) {
-            console.warn("File upload failed, saving embedded image.", uploadErr);
-            imageRef = dataUrl;
+            console.warn("File upload failed.", uploadErr);
+            throw new Error(
+              uploadErr?.message ||
+                "Image upload failed. Please try a smaller image or retry."
+            );
           }
           item._blogImageUrl = imageRef;
           if (previewImg) previewImg.src = resolveAssetUrl(imageRef);
           applySectionPreviewStyle(item);
-          if (uploadStatus) {
-            uploadStatus.textContent = imageRef.startsWith("data:")
-              ? "Image saved (embedded)."
-              : "Image uploaded.";
-          }
+          if (uploadStatus) uploadStatus.textContent = "Image uploaded.";
         } catch (err) {
           console.error(err);
           item._blogImageUrl = "";
@@ -1681,10 +1757,10 @@ document.addEventListener("DOMContentLoaded", async () => {
             await updateLocalAd(adId, { skipMode: "none" });
           }
           await renderLocalAds();
-          alert("Skip settings save ho gayi. Ab player par ad test karo.");
+          alert("Skip settings saved. Test the ad on the player now.");
         } catch (err) {
           console.error(err);
-          alert(err?.message || "Skip settings save nahi ho saki.");
+          alert(err?.message || "Could not save skip settings.");
         }
       }
     });
@@ -1717,7 +1793,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!hasIntro && !hasSectionContent) {
         if (addBlogError) {
           addBlogError.textContent =
-            "Intro text ya kam se kam ek photo/banner section add karein.";
+            "Add intro text or at least one photo/banner section.";
         }
         return;
       }
@@ -1793,7 +1869,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           openEditMovie(key);
         } catch (err) {
           console.error("Failed to open edit panel for key:", key, err);
-          alert("Edit panel open nahi ho saka. Console error check karein.");
+          alert("Could not open edit panel. Check the browser console for errors.");
         }
       }
     });
@@ -1819,18 +1895,18 @@ document.addEventListener("DOMContentLoaded", async () => {
       const epContainer = document.getElementById("download-episodes-container");
 
       if (!tmdbIdRaw) {
-        addTitleError.textContent = "TMDB ID zaroori hai.";
+        addTitleError.textContent = "TMDB ID is required.";
         return;
       }
       if (!parseTmdbIdInput(tmdbIdRaw) && !/^tt\d+$/i.test(tmdbIdRaw)) {
         addTitleError.textContent =
-          "Galat format. Sirf number (550) ya themoviedb.org link paste karein.";
+          "Invalid format. Paste only a number (550) or a themoviedb.org link.";
         return;
       }
 
       if (!listName) {
         addTitleError.textContent =
-          'Pehle "Assign to list" se list choose karein. Lists tab se nayi list bana sakte hain.';
+          'Choose a list under "Assign to list". You can create a new list in the Lists tab.';
         return;
       }
 
@@ -1968,12 +2044,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (tmdbInput) tmdbInput.value = "";
         const scriptInput = document.getElementById("download-fluid-script");
         if (scriptInput) scriptInput.value = "";
-        addTitleSuccess.textContent = `"${meta.title}" save ho gaya — home page par list "${listName}" me dikhega.`;
+        addTitleSuccess.textContent = `"${meta.title}" saved — it will appear on the home page in list "${listName}".`;
       } catch (err) {
         console.error(err);
         addTitleError.textContent =
           err?.message ||
-          "Save fail. Terminal me `node server.js` chalao aur MongoDB connected hona chahiye.";
+          "Save failed. Run `node server.js` in the terminal and ensure MongoDB is connected.";
       } finally {
         if (saveBtn) {
           saveBtn.disabled = false;

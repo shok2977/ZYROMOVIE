@@ -28,6 +28,15 @@
         max-width: 100% !important;
         height: auto !important;
       }
+      @media only screen and (max-width: 940px) {
+        #fluid-player-container video,
+        #fluid-player-container iframe,
+        #fluid-player-container .fluid_video_wrapper,
+        #fluid-player-container .fluid_video_wrapper video {
+          height: 220px !important;
+          max-height: 56vw;
+        }
+      }
     </style>
   </head>
   <body class="player-body">

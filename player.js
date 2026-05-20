@@ -1121,7 +1121,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   const playEpisode = (season, episode) => {
     selectedSeason = season;
     selectedEpisode = episode;
-    renderEpisodes(movie, playEpisode, season, episode);
     // For downloads TV/Anime, go to Fluid player per-episode page
     if (movie.sourceKind === "download") {
       const url = new URL("player-lang.html", window.location.href);
@@ -1147,7 +1146,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   };
 
-  renderEpisodes(movie, playEpisode, selectedSeason, selectedEpisode);
+  // Episode picker is built into embed players (vidsrc / streammafia / mapple).
 
   // Initial playback for embedded sources; downloads wait for episode click
   if (movie.sourceKind !== "download") {
