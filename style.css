@@ -112,6 +112,11 @@ body {
   border-color: #00b6e4;
 }
 
+body.site-blogs-only .blog-play-wrap,
+body.site-blogs-only .blog-play-btn {
+  display: none !important;
+}
+
 .blog-card-image {
   width: 100%;
   height: 160px;

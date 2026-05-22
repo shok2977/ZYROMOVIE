@@ -13,14 +13,61 @@ const API_BASE =
         return `http://${hostname}:3001`;
       })();
 
-const HOME_DATA_CLIENT_CACHE_KEY = "flakes_home_data_v2";
-const HOME_DATA_CLIENT_CACHE_MS = 5 * 60 * 1000;
+const HOME_DATA_CLIENT_CACHE_KEY = "flakes_home_data_v5";
+const HOME_DATA_CLIENT_CACHE_MS = 60 * 1000;
+const HOME_INVALIDATE_KEY = "flakes_home_invalidate";
 let homeDataInflight = null;
 
+function clearHomeDataClientCache() {
+  try {
+    sessionStorage.removeItem(HOME_DATA_CLIENT_CACHE_KEY);
+  } catch (_) {}
+}
+
+function getHomeInvalidateSignal() {
+  try {
+    return Number(localStorage.getItem(HOME_INVALIDATE_KEY) || 0);
+  } catch (_) {
+    return 0;
+  }
+}
+
 async function fetchAllData() {
-  const res = await fetch(`${API_BASE}/api/data`);
+  const revisionHint = getHomeInvalidateSignal();
+  const url = `${API_BASE}/api/data${revisionHint ? `?v=${revisionHint}` : ""}`;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to load data");
   return await res.json();
+}
+
+async function fetchHomeBanners() {
+  const revisionHint = getHomeInvalidateSignal();
+  const url = `${API_BASE}/api/banners${revisionHint ? `?v=${revisionHint}` : ""}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) return [];
+  const payload = await res.json().catch(() => ({}));
+  const raw = Array.isArray(payload?.banners)
+    ? payload.banners
+    : Array.isArray(payload)
+      ? payload
+      : [];
+  return raw.map((b) => ({
+    ...b,
+    id: b?.id || b?._id || "",
+  }));
+}
+
+async function enrichHomeDataWithBanners(data) {
+  const normalized = normalizeHomeData(data);
+  try {
+    const fresh = await fetchHomeBanners();
+    if (fresh.length) {
+      return { ...normalized, banners: fresh };
+    }
+  } catch (err) {
+    console.warn("Banner fetch failed:", err);
+  }
+  return normalized;
 }
 
 function readHomeDataCache() {
@@ -28,6 +75,10 @@ function readHomeDataCache() {
     const raw = sessionStorage.getItem(HOME_DATA_CLIENT_CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
+    const invalidateAt = getHomeInvalidateSignal();
+    if (parsed?.invalidateAt && parsed.invalidateAt < invalidateAt) {
+      return null;
+    }
     if (!parsed?.ts || Date.now() - parsed.ts > HOME_DATA_CLIENT_CACHE_MS) {
       return null;
     }
@@ -41,19 +92,63 @@ function writeHomeDataCache(data) {
   try {
     sessionStorage.setItem(
       HOME_DATA_CLIENT_CACHE_KEY,
-      JSON.stringify({ ts: Date.now(), data })
+      JSON.stringify({
+        ts: Date.now(),
+        invalidateAt: getHomeInvalidateSignal(),
+        data,
+      })
     );
   } catch (_) {}
 }
 
 function normalizeHomeData(data) {
+  const movies = data?.movies || {};
+  const listsRaw = data?.lists || {};
+  const lists = {};
+  Object.keys(listsRaw).forEach((name) => {
+    lists[name] = (listsRaw[name] || []).filter((k) => movies[k]);
+  });
+  const banners = (Array.isArray(data?.banners) ? data.banners : []).map(
+    (b) => ({
+      ...b,
+      id: b?.id || b?._id || "",
+    })
+  );
   return {
-    movies: data?.movies || {},
-    lists: data?.lists || {},
-    banners: data?.banners || [],
+    movies,
+    lists,
+    banners,
     listOrder: Array.isArray(data?.listOrder) ? data.listOrder : [],
     dbReady: data?.dbReady !== false,
+    revision: data?.revision,
   };
+}
+
+function homeMovieKeysSignature(data) {
+  return Object.keys(data?.movies || {})
+    .sort()
+    .join("|");
+}
+
+function homeListsSignature(data) {
+  return getOrderedCustomListNames(data).sort().join("|");
+}
+
+function homeBannersSignature(data) {
+  return (data?.banners || [])
+    .map((b) => String(b?.id || b?._id || ""))
+    .filter(Boolean)
+    .sort()
+    .join("|");
+}
+
+function homeDataSignature(data) {
+  return [
+    homeMovieKeysSignature(data),
+    homeListsSignature(data),
+    homeBannersSignature(data),
+    String(data?.revision ?? ""),
+  ].join("::");
 }
 
 function delay(ms) {
@@ -111,7 +206,7 @@ async function fetchAllDataPreferApi() {
   homeDataInflight = (async () => {
     try {
       const data = await fetchAllDataFromApiWithRetry();
-      const normalized = normalizeHomeData(data);
+      const normalized = await enrichHomeDataWithBanners(data);
       if (Object.keys(normalized.movies).length > 0) {
         writeHomeDataCache(normalized);
         return normalized;
@@ -132,7 +227,7 @@ async function fetchAllDataPreferApi() {
 
     try {
       const data = await fetchAllDataFromApiWithRetry(3);
-      const normalized = normalizeHomeData(data);
+      const normalized = await enrichHomeDataWithBanners(data);
       if (Object.keys(normalized.movies).length > 0) {
         writeHomeDataCache(normalized);
       }
@@ -353,7 +448,8 @@ function getOrderedCustomListNames(data) {
   const apiOrder = Array.isArray(data.listOrder) ? data.listOrder : [];
   const ordered = [];
   apiOrder.forEach((n) => {
-    if (custom.includes(n)) ordered.push(n);
+    const key = custom.find((c) => c === n);
+    if (key) ordered.push(key);
   });
   custom
     .filter((n) => !ordered.includes(n))
@@ -642,26 +738,52 @@ async function performSearch(query) {
 }
 
 async function initHomePage() {
+  try {
+    const modeRes = await fetch(`${API_BASE}/api/site/mode`);
+    if (modeRes.ok) {
+      const modeData = await modeRes.json();
+      if (modeData?.accessMode === "blogs_only") {
+        window.location.replace(`${API_BASE}/blog.html`);
+        return;
+      }
+    }
+  } catch (_) {}
+
   const cached = readHomeDataCache();
   const hasCached =
     cached?.movies && Object.keys(cached.movies).length > 0;
+  let cachedNorm = null;
 
   if (hasCached) {
-    const cachedNorm = normalizeHomeData(cached);
+    cachedNorm = normalizeHomeData(cached);
     renderDynamicLists(cachedNorm).catch(console.error);
-    initBannerSlider(cachedNorm).catch(console.error);
+    if ((cachedNorm.banners || []).length > 0) {
+      initBannerSlider(cachedNorm).catch(console.error);
+    }
   }
 
   const data = await fetchAllDataPreferApi();
-  const freshCount = Object.keys(data.movies || {}).length;
+  const freshSig = homeDataSignature(data);
+  const cachedSig = cachedNorm ? homeDataSignature(cachedNorm) : "";
 
-  if (!hasCached || freshCount > 0 || data.dbReady === true) {
+  if (!hasCached || cachedSig !== freshSig) {
     await renderDynamicLists(data);
-    await initBannerSlider(data);
   }
+
+  // Always sync banner slider from latest API (banners can change without movie/list changes)
+  await initBannerSlider(data);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  window.addEventListener("storage", (e) => {
+    if (e.key === HOME_INVALIDATE_KEY) {
+      clearHomeDataClientCache();
+      initHomePage().catch(console.error);
+    }
+  });
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) initHomePage().catch(console.error);
+  });
   initHomePage().catch(console.error);
 
   const searchInput = document.getElementById("search-input");
@@ -694,11 +816,21 @@ async function initBannerSlider(dataIn) {
   const root = document.getElementById("banner-slider-root");
   if (!root) return;
 
-  const data = dataIn || (await fetchAllDataPreferApi());
+  const data = normalizeHomeData(dataIn || (await fetchAllDataPreferApi()));
   const movies = data.movies || {};
-  const banners = Array.isArray(data.banners) ? data.banners : [];
+  let banners = [];
+  try {
+    banners = (await fetchHomeBanners()).filter((b) =>
+      String(b?.imageDataUrl || "").trim()
+    );
+  } catch (_) {
+    banners = (data.banners || []).filter((b) =>
+      String(b?.imageDataUrl || "").trim()
+    );
+  }
   if (!banners.length) {
     root.style.display = "none";
+    root.innerHTML = "";
     return;
   }
 
@@ -945,5 +1077,11 @@ function goToBannerTarget(banner, moviesFromCaller) {
       navigateToMoviePlayer(m, key);
       return;
     }
+  }
+
+  if (banner.contentType) {
+    window.location.href = `player.html?key=${encodeURIComponent(
+      `${banner.contentType}-${tmdbId}`
+    )}`;
   }
 }

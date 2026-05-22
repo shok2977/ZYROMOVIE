@@ -11,18 +11,23 @@ const API_BASE =
       : "";
 let cachedData = { movies: {}, lists: {}, banners: [], listOrder: [] };
 const LOCAL_STORAGE_KEY = "flakes_movies_data";
+const HOME_INVALIDATE_KEY = "flakes_home_invalidate";
 
 function apiUrl(path) {
   const p = String(path || "").startsWith("/") ? path : `/${path}`;
   return `${API_BASE}${p}`;
 }
 
-async function adminFetch(path, options = {}, timeoutMs = 90000) {
+async function adminFetch(path, options = {}, timeoutMs = 45000) {
   const url = String(path).startsWith("http") ? path : apiUrl(path);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const headers = {
+    "X-Zyro-Admin": "1",
+    ...(options.headers || {}),
+  };
   try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
+    return await fetch(url, { ...options, headers, signal: ctrl.signal });
   } catch (err) {
     if (err?.name === "AbortError") {
       throw new Error("Request timed out — please try again.");
@@ -40,8 +45,130 @@ async function adminFetch(path, options = {}, timeoutMs = 90000) {
   }
 }
 
+function signalHomePageRefresh() {
+  try {
+    localStorage.setItem(HOME_INVALIDATE_KEY, String(Date.now()));
+  } catch (_) {}
+}
+
+function patchLocalStorageAfterMovieDelete(key) {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed?.movies?.[key]) {
+      delete parsed.movies[key];
+    }
+    if (parsed?.lists) {
+      Object.keys(parsed.lists).forEach((listName) => {
+        parsed.lists[listName] = (parsed.lists[listName] || []).filter(
+          (k) => k !== key
+        );
+      });
+    }
+    if (Array.isArray(parsed.banners)) {
+      parsed.banners = parsed.banners.filter((b) => b?.movieKey !== key);
+    }
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(parsed));
+  } catch (_) {}
+}
+
+function patchCacheAfterMovieDelete(key) {
+  if (!key) return;
+  delete cachedData.movies[key];
+  Object.keys(cachedData.lists || {}).forEach((listName) => {
+    cachedData.lists[listName] = (cachedData.lists[listName] || []).filter(
+      (k) => k !== key
+    );
+  });
+  cachedData.banners = (cachedData.banners || []).filter(
+    (b) => b?.movieKey !== key
+  );
+  patchLocalStorageAfterMovieDelete(key);
+  signalHomePageRefresh();
+}
+
+function listNameMatches(a, b) {
+  return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
+}
+
+function patchLocalStorageAfterListDelete(name) {
+  try {
+    const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed?.lists) {
+      Object.keys(parsed.lists).forEach((listName) => {
+        if (listNameMatches(listName, name)) {
+          delete parsed.lists[listName];
+        }
+      });
+    }
+    if (Array.isArray(parsed.listOrder)) {
+      parsed.listOrder = parsed.listOrder.filter((n) => !listNameMatches(n, name));
+    }
+    localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(parsed));
+  } catch (_) {}
+}
+
+function reconcileCachedLists() {
+  if (!cachedData.lists) cachedData.lists = {};
+  const keys = Object.keys(cachedData.lists);
+  if (Array.isArray(cachedData.listOrder)) {
+    cachedData.listOrder = cachedData.listOrder.filter((n) =>
+      Object.prototype.hasOwnProperty.call(cachedData.lists, n)
+    );
+    const orderSet = new Set(cachedData.listOrder);
+    keys.forEach((k) => {
+      if (!orderSet.has(k)) delete cachedData.lists[k];
+    });
+  } else {
+    cachedData.listOrder = keys.filter((n) => !isReservedRandomListName(n));
+  }
+  Object.keys(cachedData.lists).forEach((k) => {
+    if (!Array.isArray(cachedData.lists[k])) cachedData.lists[k] = [];
+  });
+}
+
+async function syncListsCacheFromApi() {
+  const res = await adminFetch(`/api/lists?_=${Date.now()}`, {}, 15000);
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(payload.error || `Failed to load lists (HTTP ${res.status})`);
+  }
+  cachedData.lists = payload.lists || {};
+  cachedData.listOrder = Array.isArray(payload.listOrder)
+    ? payload.listOrder
+    : Array.isArray(payload.names)
+      ? payload.names
+      : [];
+  reconcileCachedLists();
+  return cachedData;
+}
+
+function patchCacheAfterListDelete(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return;
+  Object.keys(cachedData.lists || {}).forEach((listName) => {
+    if (listNameMatches(listName, trimmed)) {
+      delete cachedData.lists[listName];
+    }
+  });
+  if (Array.isArray(cachedData.listOrder)) {
+    cachedData.listOrder = cachedData.listOrder.filter(
+      (n) => !listNameMatches(n, trimmed)
+    );
+  }
+  reconcileCachedLists();
+  patchLocalStorageAfterListDelete(trimmed);
+  signalHomePageRefresh();
+}
+
 async function refreshData() {
-  const res = await adminFetch("/api/data");
+  let res = await adminFetch("/api/admin/data", {}, 60000);
+  if (res.status === 403 || res.status === 404) {
+    res = await adminFetch("/api/data", {}, 60000);
+  }
   const payload = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(
@@ -57,6 +184,7 @@ async function refreshData() {
   cachedData.listOrder = Array.isArray(cachedData.listOrder)
     ? cachedData.listOrder
     : [];
+  reconcileCachedLists();
   return cachedData;
 }
 
@@ -80,7 +208,8 @@ function getOrderedCustomListNames(data) {
   const apiOrder = Array.isArray(data.listOrder) ? data.listOrder : [];
   const ordered = [];
   apiOrder.forEach((n) => {
-    if (custom.includes(n)) ordered.push(n);
+    const key = custom.find((c) => c === n);
+    if (key) ordered.push(key);
   });
   custom
     .filter((n) => !ordered.includes(n))
@@ -105,11 +234,33 @@ async function upsertMovie(movie) {
 }
 
 async function deleteMovie(key) {
-  const res = await adminFetch(`/api/movie/${encodeURIComponent(key)}`, {
+  const trimmed = String(key || "").trim();
+  if (!trimmed) throw new Error("Movie key is missing.");
+
+  let res = await adminFetch(`/api/movie/${encodeURIComponent(trimmed)}`, {
     method: "DELETE",
-  });
-  if (!res.ok) throw new Error("Failed to delete movie");
-  return await res.json();
+  }, 20000);
+
+  if (res.status === 403 || res.status === 405) {
+    res = await adminFetch(
+      "/api/movie/delete",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: trimmed }),
+      },
+      20000
+    );
+  }
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(
+      data.error || data.message || `Failed to delete movie (HTTP ${res.status})`
+    );
+  }
+  patchCacheAfterMovieDelete(trimmed);
+  return data;
 }
 
 async function upsertList(name) {
@@ -127,16 +278,24 @@ async function upsertList(name) {
 
 async function deleteList(name) {
   const trimmed = String(name || "").trim();
+  if (!trimmed) throw new Error("List name is required.");
+
   const res = await adminFetch("/api/list", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: trimmed, action: "delete" }),
-  });
+  }, 20000);
   const raw = await res.text();
   let data = {};
   try {
     data = raw ? JSON.parse(raw) : {};
   } catch (_) {}
+
+  if (res.status === 404) {
+    patchCacheAfterListDelete(trimmed);
+    return { ok: true, alreadyDeleted: true };
+  }
+
   if (!res.ok) {
     const routeMissing =
       res.status === 404 && !data.error && /cannot post/i.test(raw);
@@ -147,6 +306,7 @@ async function deleteList(name) {
           : `List delete failed (HTTP ${res.status})`)
     );
   }
+  patchCacheAfterListDelete(trimmed);
   return data;
 }
 
@@ -164,35 +324,95 @@ async function assignMovieToList(name, key) {
 }
 
 async function reorderListsApi(order) {
-  const res = await fetch(`${API_BASE}/api/lists/reorder`, {
+  const res = await adminFetch("/api/lists/reorder", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ order }),
   });
-  if (!res.ok) throw new Error("Failed to save list order");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to save list order (HTTP ${res.status})`);
+  }
+  invalidateHomeFromAdmin();
+  return data;
+}
+
+function patchCacheAfterBannerAdd(banner) {
+  if (!banner) return;
+  const entry = {
+    ...banner,
+    id: String(banner.id || banner._id || ""),
+  };
+  if (!Array.isArray(cachedData.banners)) cachedData.banners = [];
+  cachedData.banners = cachedData.banners.filter(
+    (b) => String(b?.id || b?._id || "") !== entry.id
+  );
+  cachedData.banners.push(entry);
+  signalHomePageRefresh();
+}
+
+function patchCacheAfterBannerDelete(id) {
+  const bid = String(id || "").trim();
+  if (!bid) return;
+  cachedData.banners = (cachedData.banners || []).filter(
+    (b) => String(b?.id || b?._id || "") !== bid
+  );
+  signalHomePageRefresh();
+}
+
+function invalidateHomeFromAdmin() {
+  signalHomePageRefresh();
 }
 
 async function addBanner(payload) {
-  const res = await fetch(`${API_BASE}/api/banner`, {
+  const res = await adminFetch("/api/banner", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error("Failed to add banner");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to add banner (HTTP ${res.status})`);
+  }
+  patchCacheAfterBannerAdd(data);
+  invalidateHomeFromAdmin();
+  return data;
 }
 
 async function deleteBanner(id) {
-  const res = await fetch(`${API_BASE}/api/banner/${encodeURIComponent(id)}`, {
+  const bid = String(id || "").trim();
+  if (!bid) throw new Error("Banner ID is missing.");
+
+  let res = await adminFetch(`/api/banner/${encodeURIComponent(bid)}`, {
     method: "DELETE",
-  });
-  if (!res.ok) throw new Error("Failed to delete banner");
-  return await res.json();
+  }, 20000);
+
+  if (res.status === 403 || res.status === 405) {
+    res = await adminFetch(
+      "/api/banner/delete",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: bid }),
+      },
+      20000
+    );
+  }
+
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 404 || data?.alreadyDeleted) {
+    patchCacheAfterBannerDelete(bid);
+    return { ok: true, alreadyDeleted: true };
+  }
+  if (!res.ok) {
+    throw new Error(data.error || data.message || `Failed to delete banner (HTTP ${res.status})`);
+  }
+  patchCacheAfterBannerDelete(bid);
+  return data;
 }
 
 async function fetchLocalAds() {
-  const res = await fetch(`${API_BASE}/api/local-ads`);
+  const res = await adminFetch("/api/local-ads");
   if (!res.ok) return [];
   const data = await res.json();
   return Array.isArray(data) ? data : [];
@@ -221,20 +441,27 @@ async function createLocalAd(payload) {
 }
 
 async function updateLocalAd(id, payload) {
-  const res = await fetch(`${API_BASE}/api/local-ads/${encodeURIComponent(id)}`, {
+  const res = await adminFetch(`/api/local-ads/${encodeURIComponent(id)}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error("Failed to update local ad");
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to update local ad (HTTP ${res.status})`);
+  }
+  return data;
 }
 
 async function deleteLocalAd(id) {
-  const res = await fetch(`${API_BASE}/api/local-ads/${encodeURIComponent(id)}`, {
+  const res = await adminFetch(`/api/local-ads/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error("Failed to delete local ad");
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Failed to delete local ad (HTTP ${res.status})`);
+  }
+  return data;
 }
 
 function resolveAdminAssetUrl(url) {
@@ -245,7 +472,7 @@ function resolveAdminAssetUrl(url) {
 }
 
 async function uploadBlogImage(dataUrl) {
-  const res = await fetch(`${API_BASE}/api/blog/upload-image`, {
+  const res = await adminFetch("/api/blog/upload-image", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ dataUrl }),
@@ -256,7 +483,7 @@ async function uploadBlogImage(dataUrl) {
 }
 
 async function addBlog(payload) {
-  const res = await fetch(`${API_BASE}/api/blog`, {
+  const res = await adminFetch("/api/blog", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -267,17 +494,18 @@ async function addBlog(payload) {
 }
 
 async function fetchBlogs() {
-  const res = await fetch(`${API_BASE}/api/blogs`);
+  const res = await adminFetch("/api/blogs");
   if (!res.ok) throw new Error("Failed to load blogs");
   return await res.json();
 }
 
 async function deleteBlog(id) {
-  const res = await fetch(`${API_BASE}/api/blog/${encodeURIComponent(id)}`, {
+  const res = await adminFetch(`/api/blog/${encodeURIComponent(id)}`, {
     method: "DELETE",
   });
-  if (!res.ok) throw new Error("Failed to delete blog");
-  return await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Failed to delete blog");
+  return data;
 }
 
 async function maybeMigrateLocalToApi() {
@@ -331,17 +559,28 @@ function getMovieIdKey(tmdbId, type) {
   return `${type}-${tmdbId}`;
 }
 
+function listExistsInData(data, name) {
+  const lower = String(name || "").trim().toLowerCase();
+  return Object.keys(data?.lists || {}).some(
+    (k) => k.trim().toLowerCase() === lower
+  );
+}
+
 async function ensureDefaultListsInApi() {
   const defaults = ["Anime", "New Releases", "Hidden Gems", "Best", "Top 10"];
   const data = loadMovieData();
   await Promise.all(
     defaults.map(async (name) => {
-      if (!data.lists || !data.lists[name]) {
+      if (!listExistsInData(data, name)) {
         await upsertList(name);
       }
     })
   );
-  await refreshData();
+  try {
+    await syncListsCacheFromApi();
+  } catch (_) {
+    await refreshData();
+  }
 }
 
 function setAuth(state) {
@@ -360,6 +599,47 @@ function switchSection(targetId) {
   document.querySelectorAll(".admin-nav-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.getAttribute("data-section") === targetId);
   });
+}
+
+async function loadSiteAccessModeAdmin() {
+  const select = document.getElementById("site-access-mode");
+  if (!select) return;
+  try {
+    const res = await adminFetch("/api/site/mode");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || "Failed to load site mode");
+    select.value =
+      data.accessMode === "blogs_only" ? "blogs_only" : "normal";
+  } catch (err) {
+    const statusEl = document.getElementById("site-access-mode-status");
+    if (statusEl) {
+      statusEl.textContent = err?.message || "Could not load site mode.";
+    }
+  }
+}
+
+async function saveSiteAccessModeAdmin() {
+  const select = document.getElementById("site-access-mode");
+  const statusEl = document.getElementById("site-access-mode-status");
+  if (!select) return;
+  const accessMode = select.value === "blogs_only" ? "blogs_only" : "normal";
+  try {
+    const res = await adminFetch("/api/site/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accessMode }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error || "Failed to save site mode");
+    if (statusEl) {
+      statusEl.textContent =
+        accessMode === "blogs_only"
+          ? "Saved: Blogs only mode is ON. Home and player are blocked for visitors."
+          : "Saved: Normal mode — full website for visitors.";
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err?.message || "Could not save site mode.";
+  }
 }
 
 function renderDashboard() {
@@ -572,13 +852,13 @@ function openEditMovie(key) {
 }
 
 function renderLists() {
+  reconcileCachedLists();
   const data = loadMovieData();
   const listsTable = document.getElementById("lists-table");
   const assignListSelect = document.getElementById("assign-list");
   if (!listsTable || !assignListSelect) return;
 
   listsTable.innerHTML = "";
-  populateAssignListSelect(data);
 
   const note = document.createElement("p");
   note.className = "admin-help-text";
@@ -637,14 +917,23 @@ function renderLists() {
           ? `Delete list "${name}"? Its ${count} title(s) will stay on the site — only the list is removed.`
           : `Delete list "${name}"?`;
       if (!confirm(msg)) return;
+      delBtn.disabled = true;
       try {
         await deleteList(name);
-        await refreshData();
+        await refreshAssignListSelect();
         renderLists();
         renderDashboard();
       } catch (e) {
         console.error(e);
         alert(e?.message || "Could not delete list.");
+        refreshData()
+          .then(() => {
+            renderLists();
+            renderDashboard();
+          })
+          .catch(console.error);
+      } finally {
+        delBtn.disabled = false;
       }
     });
     actionCell.appendChild(delBtn);
@@ -656,7 +945,7 @@ function renderLists() {
     table.appendChild(row);
   });
   listsTable.appendChild(table);
-  populateAssignListSelect(data);
+  refreshAssignListSelect().catch(console.error);
 
   const saveOrderBtn = document.createElement("button");
   saveOrderBtn.type = "button";
@@ -744,7 +1033,7 @@ function renderBanners() {
     delBtn.type = "button";
     delBtn.className = "admin-delete-btn";
     delBtn.textContent = "Delete";
-    delBtn.dataset.bannerId = b.id || b._id;
+    delBtn.dataset.bannerId = String(b.id || b._id || "");
     actionCell.appendChild(delBtn);
 
     row.appendChild(imgCell);
@@ -1123,15 +1412,15 @@ async function fetchTmdbMetaForAdd(tmdbIdRaw, preferredType) {
   }
 }
 
-function populateAssignListSelect(data) {
+function renderAssignListOptions(listNames) {
   const select = document.getElementById("assign-list");
   if (!select) return false;
 
   const prev = select.value;
   select.innerHTML = "";
-  const listNames = getOrderedCustomListNames(data);
+  const names = (listNames || []).filter((n) => !isReservedRandomListName(n));
 
-  if (!listNames.length) {
+  if (!names.length) {
     const opt = document.createElement("option");
     opt.value = "";
     opt.textContent = "Create a list in the Lists tab first (Anime, Best, …)";
@@ -1139,15 +1428,38 @@ function populateAssignListSelect(data) {
     return false;
   }
 
-  listNames.forEach((name) => {
+  names.forEach((name) => {
     const opt = document.createElement("option");
     opt.value = name;
     opt.textContent = name;
     select.appendChild(opt);
   });
 
-  if (prev && listNames.includes(prev)) select.value = prev;
+  const prevKey = names.find((n) => listNameMatches(n, prev));
+  if (prevKey) select.value = prevKey;
   return true;
+}
+
+async function refreshAssignListSelect() {
+  try {
+    await syncListsCacheFromApi();
+    renderAssignListOptions(getOrderedCustomListNames(loadMovieData()));
+    return;
+  } catch (err) {
+    console.warn("/api/lists failed, reloading admin data:", err);
+  }
+  try {
+    await refreshData();
+    renderAssignListOptions(getOrderedCustomListNames(loadMovieData()));
+  } catch (err2) {
+    console.error("Assign list dropdown could not refresh:", err2);
+    renderAssignListOptions([]);
+  }
+}
+
+function populateAssignListSelect() {
+  reconcileCachedLists();
+  return renderAssignListOptions(getOrderedCustomListNames(loadMovieData()));
 }
 
 async function fetchTmdbTvSeasonsDirect(tmdbId, maxSeasons = 3) {
@@ -1223,6 +1535,13 @@ document.addEventListener("DOMContentLoaded", async () => {
   const editLangSaveBtn = document.getElementById("edit-movie-save");
   const editLangCancelBtn = document.getElementById("edit-movie-cancel");
 
+  const siteAccessModeSaveBtn = document.getElementById("site-access-mode-save");
+  if (siteAccessModeSaveBtn) {
+    siteAccessModeSaveBtn.addEventListener("click", () => {
+      saveSiteAccessModeAdmin().catch(console.error);
+    });
+  }
+
   if (isAuthed()) {
     if (loginCard) loginCard.style.display = "none";
     if (panel) panel.style.display = "flex";
@@ -1230,7 +1549,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     await maybeMigrateLocalToApi();
     await ensureDefaultListsInApi();
     renderDashboard();
+    await loadSiteAccessModeAdmin();
     renderLists();
+    await refreshAssignListSelect();
     renderBanners();
     await renderLocalAds();
     await renderBlogs();
@@ -1250,7 +1571,9 @@ document.addEventListener("DOMContentLoaded", async () => {
       await maybeMigrateLocalToApi();
         await ensureDefaultListsInApi();
         renderDashboard();
+        await loadSiteAccessModeAdmin();
         renderLists();
+        await refreshAssignListSelect();
         renderBanners();
         await renderLocalAds();
         await renderBlogs();
@@ -1274,7 +1597,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (t === "add-movie-section") {
         try {
           await ensureDefaultListsInApi();
-          renderLists();
+          await refreshAssignListSelect();
         } catch (err) {
           console.error(err);
         }
@@ -1300,6 +1623,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       await upsertList(name);
       if (input) input.value = "";
       await refreshData();
+      await refreshAssignListSelect();
       renderLists();
     });
   }
@@ -1584,35 +1908,64 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
 
-      await addBanner({
-        title,
-        description: description || "",
-        tmdbId,
-        contentType,
-        imageDataUrl: currentBannerImageDataUrl,
-        createdAt: Date.now(),
-      });
-      await refreshData();
-      renderBanners();
-
-      // Reset form (keep image in case admin wants to add many quickly)
-      if (bannerTitleInput) bannerTitleInput.value = "";
-      if (bannerDescInput) bannerDescInput.value = "";
-      if (bannerTmdbInput) bannerTmdbInput.value = "";
-      if (bannerContentTypeSelect) bannerContentTypeSelect.value = "movie";
+      const submitBtn = bannerForm.querySelector('button[type="submit"]');
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Saving…";
+      }
+      try {
+        await addBanner({
+          title,
+          description: description || "",
+          tmdbId,
+          contentType,
+          imageDataUrl: currentBannerImageDataUrl,
+          createdAt: Date.now(),
+        });
+        currentBannerImageDataUrl = "";
+        if (bannerPreviewWrap) bannerPreviewWrap.style.display = "none";
+        if (bannerPreviewImg) bannerPreviewImg.src = "";
+        await refreshData();
+        renderBanners();
+        if (bannerTitleInput) bannerTitleInput.value = "";
+        if (bannerDescInput) bannerDescInput.value = "";
+        if (bannerTmdbInput) bannerTmdbInput.value = "";
+        if (bannerContentTypeSelect) bannerContentTypeSelect.value = "movie";
+      } catch (err) {
+        console.error(err);
+        if (bannerErrorEl) {
+          bannerErrorEl.textContent =
+            err?.message || "Failed to save banner. Restart server and try again.";
+        }
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Add Banner";
+        }
+      }
     });
   }
 
   if (bannersListEl) {
     bannersListEl.addEventListener("click", async (e) => {
-      const target = e.target;
-      if (!target) return;
-      if (target.classList?.contains("admin-delete-btn")) {
-        const bannerId = target.dataset.bannerId;
-        if (!bannerId) return;
+      const btn = e.target?.closest?.("button");
+      if (!btn?.classList?.contains("admin-delete-btn")) return;
+      const bannerId = btn.dataset.bannerId;
+      if (!bannerId) return;
+      if (!confirm("Delete this banner?")) return;
+      btn.disabled = true;
+      try {
         await deleteBanner(bannerId);
-        await refreshData();
         renderBanners();
+        refreshData().catch(console.error);
+      } catch (err) {
+        console.error(err);
+        alert(err?.message || "Could not delete banner.");
+        refreshData()
+          .then(() => renderBanners())
+          .catch(console.error);
+      } finally {
+        btn.disabled = false;
       }
     });
   }
@@ -1857,12 +2210,26 @@ document.addEventListener("DOMContentLoaded", async () => {
       const key = btn ? btn.getAttribute("data-key") : null;
 
       if (btn && btn.classList?.contains("admin-delete-btn")) {
-        const key = btn.getAttribute("data-key");
-        if (!key) return;
-        await deleteMovie(key);
-        await refreshData();
-        renderDashboard();
-        renderLists();
+        const delKey = btn.getAttribute("data-key");
+        if (!delKey) return;
+        if (!confirm(`Delete "${delKey}" from the library?`)) return;
+        btn.disabled = true;
+        try {
+          await deleteMovie(delKey);
+          renderDashboard();
+          renderLists();
+        } catch (err) {
+          console.error(err);
+          alert(err?.message || "Could not delete movie.");
+          refreshData()
+            .then(() => {
+              renderDashboard();
+              renderLists();
+            })
+            .catch(console.error);
+        } finally {
+          btn.disabled = false;
+        }
       } else if (btn && btn.classList?.contains("admin-edit-btn")) {
         if (!key) return;
         try {

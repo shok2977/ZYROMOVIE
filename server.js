@@ -450,6 +450,16 @@ const blogSchema = new mongoose.Schema({
   updatedAt: Number,
 });
 
+const siteSettingSchema = new mongoose.Schema({
+  key: { type: String, unique: true, default: "global" },
+  /** normal = full site; blogs_only = blog list + blog pages only (no home/player) */
+  accessMode: {
+    type: String,
+    enum: ["normal", "blogs_only"],
+    default: "normal",
+  },
+});
+
 const localAdSchema = new mongoose.Schema({
   title: { type: String, default: "" },
   videoUrl: { type: String, required: true },
@@ -498,6 +508,95 @@ const List = mongoose.model("List", listSchema);
 const Banner = mongoose.model("Banner", bannerSchema);
 const Blog = mongoose.model("Blog", blogSchema);
 const LocalAd = mongoose.model("LocalAd", localAdSchema);
+const SiteSetting = mongoose.model("SiteSetting", siteSettingSchema);
+
+async function getSiteAccessMode() {
+  if (mongoose.connection.readyState !== 1) return "normal";
+  const doc = await SiteSetting.findOne({ key: "global" }).lean();
+  return doc?.accessMode === "blogs_only" ? "blogs_only" : "normal";
+}
+
+function isStaticAssetPath(pathname) {
+  return /\.(css|js|mjs|map|jpeg|jpg|png|gif|webp|ico|svg|woff2?|ttf|txt|xml)$/i.test(
+    pathname
+  );
+}
+
+function isBlogPublicPath(pathname) {
+  const p = pathname.replace(/\/$/, "") || "/";
+  if (p === "/blog" || p === "/blog.html") return true;
+  if (/^\/blog\/[^/]+$/i.test(p)) return true;
+  return false;
+}
+
+function isBlockedInBlogsOnlyMode(pathname) {
+  const p = pathname.toLowerCase();
+  if (p === "/" || p === "/index.html") return true;
+  if (p === "/player.html" || p === "/player-lang.html") return true;
+  if (p.startsWith("/player")) return true;
+  return false;
+}
+
+const ADMIN_PANEL_HEADER = "x-zyro-admin";
+
+function isAdminPanelRequest(req) {
+  if (req.get(ADMIN_PANEL_HEADER) === "1") return true;
+  const ref = String(req.get("referer") || req.get("referrer") || "");
+  return /\/admin(\/|$)/i.test(ref);
+}
+
+async function blogsOnlyGate(req, res, next) {
+  const mode = await getSiteAccessMode();
+  if (mode !== "blogs_only") return next();
+
+  if (isAdminPanelRequest(req)) return next();
+
+  const p = req.path;
+
+  if (p.startsWith("/admin")) return next();
+
+  if (p.startsWith("/api/")) {
+    if (
+      p === "/api/site/mode" ||
+      p === "/api/lists" ||
+      p.startsWith("/api/blogs") ||
+      /^\/api\/blog\/[^/]+$/.test(p) ||
+      p === "/api/health"
+    ) {
+      return next();
+    }
+    if (
+      p === "/api/data" ||
+      p === "/api/banners" ||
+      p.startsWith("/api/search") ||
+      p.startsWith("/api/movie") ||
+      p.startsWith("/api/list") ||
+      p.startsWith("/api/banner") ||
+      p.startsWith("/api/local-ads") ||
+      p.startsWith("/api/tmdb") ||
+      p.startsWith("/api/vast")
+    ) {
+      return res.status(403).json({ error: "Unavailable in blogs-only mode." });
+    }
+    return next();
+  }
+
+  if (isBlockedInBlogsOnlyMode(p)) {
+    return res.redirect(302, "/blog.html");
+  }
+
+  if (isBlogPublicPath(p)) return next();
+
+  if (isStaticAssetPath(p) || p === "/api-config.js" || p.startsWith("/uploads/")) {
+    return next();
+  }
+
+  if (p.endsWith(".html") || !p.includes(".")) {
+    return res.redirect(302, "/blog.html");
+  }
+
+  return next();
+}
 
 function escapeHtml(input) {
   return String(input || "")
@@ -840,12 +939,48 @@ function renderBlogSectionsHtml(blog, req) {
 
 // ---- API ----
 
-app.get("/api/health", (req, res) => {
+app.use(blogsOnlyGate);
+
+app.get("/api/health", async (req, res) => {
   res.json({
     ok: true,
     db: mongoose.connection.readyState === 1,
-    features: { localAds: true, listDelete: true },
+    accessMode: await getSiteAccessMode(),
+    features: {
+      localAds: true,
+      listDelete: true,
+      siteAccessMode: true,
+      listsApi: true,
+      bannerDelete: true,
+      homeBannersApi: true,
+    },
   });
+});
+
+app.get("/api/site/mode", async (req, res) => {
+  res.json({ accessMode: await getSiteAccessMode() });
+});
+
+app.post("/api/site/mode", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const mode = String(req.body?.accessMode || "").trim();
+  if (mode !== "normal" && mode !== "blogs_only") {
+    res.status(400).json({
+      error: 'accessMode must be "normal" or "blogs_only"',
+    });
+    return;
+  }
+  await SiteSetting.findOneAndUpdate(
+    { key: "global" },
+    { accessMode: mode },
+    { upsert: true, returnDocument: "after" }
+  );
+  res.json({ accessMode: mode });
 });
 
 app.get("/api/tmdb/resolve", async (req, res) => {
@@ -915,11 +1050,31 @@ app.get("/api/tmdb/seasons", async (req, res) => {
 
 let homeDataPayloadCache = null;
 let homeDataPayloadCacheAt = 0;
-const HOME_DATA_SERVER_CACHE_MS = 45 * 1000;
+let homeDataRevision = 0;
+const HOME_DATA_SERVER_CACHE_MS = 8 * 1000;
 
 function invalidateHomeDataCache() {
   homeDataPayloadCache = null;
   homeDataPayloadCacheAt = 0;
+  homeDataRevision += 1;
+}
+
+function pruneListsToExistingMovies(listsByName, moviesByKey) {
+  const out = {};
+  Object.keys(listsByName || {}).forEach((name) => {
+    out[name] = (listsByName[name] || []).filter((k) => moviesByKey[k]);
+  });
+  return out;
+}
+
+function mapBannersForClient(banners) {
+  return (banners || []).map((b) => {
+    const lean = { ...b, id: b._id?.toString?.() || b.id };
+    if (!lean.movieKey && lean.tmdbId && lean.contentType) {
+      lean.movieKey = `${lean.contentType}-${lean.tmdbId}`;
+    }
+    return lean;
+  });
 }
 
 function movieForHomeClient(doc) {
@@ -981,28 +1136,153 @@ async function buildHomeDataPayload() {
   lists.forEach((l) => {
     listsByName[l.name] = l.movieKeys || [];
   });
-  const listOrder = lists.map((l) => l.name);
-
-  const bannersWithKeys = banners.map((b) => {
-    const lean = { ...b, id: b._id?.toString?.() || b.id };
-    if (!lean.movieKey && lean.tmdbId && lean.contentType) {
-      lean.movieKey = `${lean.contentType}-${lean.tmdbId}`;
-    }
-    return lean;
-  });
+  const prunedLists = pruneListsToExistingMovies(listsByName, moviesByKey);
+  const listOrder = lists
+    .map((l) => l.name)
+    .filter((name) => prunedLists[name] !== undefined);
 
   return {
     movies: moviesByKey,
-    lists: listsByName,
+    lists: prunedLists,
     listOrder,
-    banners: bannersWithKeys,
+    banners: mapBannersForClient(banners),
     dbReady: true,
+    revision: homeDataRevision,
   };
 }
 
+async function buildAdminDataPayload() {
+  const [movies, listsFromDb, banners] = await Promise.all([
+    Movie.find().lean(),
+    List.find().select("name movieKeys sortOrder").lean(),
+    Banner.find().lean(),
+  ]);
+
+  const moviesByKey = {};
+  movies.forEach((m) => {
+    if (m?.key) moviesByKey[m.key] = m;
+  });
+
+  const listsByName = {};
+  const lists = [...listsFromDb].sort(
+    (a, b) =>
+      (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) ||
+      String(a.name).localeCompare(String(b.name))
+  );
+  lists.forEach((l) => {
+    listsByName[l.name] = l.movieKeys || [];
+  });
+  const prunedLists = pruneListsToExistingMovies(listsByName, moviesByKey);
+  const listOrder = lists
+    .map((l) => l.name)
+    .filter((name) => prunedLists[name] !== undefined);
+
+  return {
+    movies: moviesByKey,
+    lists: prunedLists,
+    listOrder,
+    banners: mapBannersForClient(banners),
+    dbReady: true,
+    revision: homeDataRevision,
+  };
+}
+
+// Lightweight list names for admin dropdowns (always fresh from DB)
+app.get("/api/lists", async (req, res) => {
+  if (!isAdminPanelRequest(req)) {
+    res.status(403).json({ error: "Admin access only." });
+    return;
+  }
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  if (mongoose.connection.readyState !== 1) {
+    res.json({ names: [], lists: {}, listOrder: [] });
+    return;
+  }
+  try {
+    const listsFromDb = await List.find().select("name movieKeys sortOrder").lean();
+    const lists = [...listsFromDb].sort(
+      (a, b) =>
+        (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) ||
+        String(a.name).localeCompare(String(b.name))
+    );
+    const listsByName = {};
+    lists.forEach((l) => {
+      listsByName[l.name] = l.movieKeys || [];
+    });
+    const listOrder = lists.map((l) => l.name);
+    res.json({ names: listOrder, lists: listsByName, listOrder });
+  } catch (e) {
+    res.status(500).json({
+      names: [],
+      lists: {},
+      listOrder: [],
+      error: e?.message || "Failed to load lists",
+    });
+  }
+});
+
+// Full library for admin panel (all movie fields for edit/delete)
+app.get("/api/admin/data", async (req, res) => {
+  if (!isAdminPanelRequest(req)) {
+    res.status(403).json({ error: "Admin access only." });
+    return;
+  }
+  res.set("Cache-Control", "no-store");
+  if (mongoose.connection.readyState !== 1) {
+    res.json({
+      movies: {},
+      lists: {},
+      listOrder: [],
+      banners: [],
+      dbReady: false,
+    });
+    return;
+  }
+  try {
+    res.json(await buildAdminDataPayload());
+  } catch (e) {
+    res.status(500).json({
+      movies: {},
+      lists: {},
+      listOrder: [],
+      banners: [],
+      dbReady: false,
+      error: e?.message || "Failed to load admin data",
+    });
+  }
+});
+
+// Home banners only — always read from DB (not served from /api/data cache)
+app.get("/api/banners", async (req, res) => {
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.set("Pragma", "no-cache");
+
+  if (mongoose.connection.readyState !== 1) {
+    res.json({ banners: [], dbReady: false, revision: homeDataRevision });
+    return;
+  }
+
+  try {
+    const banners = await Banner.find().lean();
+    res.json({
+      banners: mapBannersForClient(banners),
+      dbReady: true,
+      revision: homeDataRevision,
+    });
+  } catch (e) {
+    res.status(500).json({
+      banners: [],
+      dbReady: false,
+      revision: homeDataRevision,
+      error: e?.message || "Failed to load banners",
+    });
+  }
+});
+
 // All data for front-end (movies by key, lists by name, banners array)
 app.get("/api/data", async (req, res) => {
-  res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
+  res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.set("Pragma", "no-cache");
 
   if (mongoose.connection.readyState !== 1) {
     res.set("Cache-Control", "no-store");
@@ -1355,13 +1635,44 @@ app.post("/api/movie", async (req, res) => {
   }
 });
 
+async function deleteMovieByKey(key, res) {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const trimmed = String(key || "").trim();
+  if (!trimmed) {
+    res.status(400).json({ error: "Movie key is required." });
+    return;
+  }
+  try {
+    const result = await Movie.deleteOne({ key: trimmed });
+    if (!result.deletedCount) {
+      res.status(404).json({ error: `Movie "${trimmed}" was not found.` });
+      return;
+    }
+    await List.updateMany({}, { $pull: { movieKeys: trimmed } });
+    await Banner.updateMany({ movieKey: trimmed }, { $unset: { movieKey: "" } });
+    invalidateHomeDataCache();
+    res.json({ ok: true, key: trimmed, revision: homeDataRevision });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to delete movie",
+      message: e?.message ?? String(e),
+    });
+  }
+}
+
 // Delete movie
 app.delete("/api/movie/:key", async (req, res) => {
-  const key = req.params.key;
-  await Movie.deleteOne({ key });
-  await List.updateMany({}, { $pull: { movieKeys: key } });
-  invalidateHomeDataCache();
-  res.json({ ok: true });
+  const key = decodeURIComponent(req.params.key || "");
+  await deleteMovieByKey(key, res);
+});
+
+app.post("/api/movie/delete", async (req, res) => {
+  await deleteMovieByKey(req.body?.key, res);
 });
 
 function isReservedRandomListName(name) {
@@ -1382,25 +1693,24 @@ async function deleteListByName(name, res) {
     return;
   }
   try {
-    let result = await List.deleteOne({ name: trimmed });
-    if (!result.deletedCount) {
-      const all = await List.find().lean();
-      const match = all.find(
-        (l) =>
-          String(l.name || "").trim().toLowerCase() === trimmed.toLowerCase()
-      );
-      if (match) {
-        result = await List.deleteOne({ _id: match._id });
-      }
+    const lower = trimmed.toLowerCase();
+    const all = await List.find().lean();
+    const matches = all.filter(
+      (l) => String(l.name || "").trim().toLowerCase() === lower
+    );
+    if (!matches.length) {
+      res.json({ ok: true, alreadyDeleted: true, name: trimmed });
+      return;
     }
+    const result = await List.deleteMany({
+      _id: { $in: matches.map((m) => m._id) },
+    });
     if (!result.deletedCount) {
-      res.status(404).json({
-        error: `List "${trimmed}" was not found in the database. Restart the server and try again.`,
-      });
+      res.json({ ok: true, alreadyDeleted: true, name: trimmed });
       return;
     }
     invalidateHomeDataCache();
-    res.json({ ok: true });
+    res.json({ ok: true, name: trimmed, revision: homeDataRevision });
   } catch (e) {
     res.status(500).json({
       error: "Failed to delete list",
@@ -1512,20 +1822,80 @@ app.post("/api/list/assign", async (req, res) => {
 
 // Add banner
 app.post("/api/banner", async (req, res) => {
-  const payload = { ...req.body };
-  if (payload.tmdbId) {
-    payload.movieKey = await resolveMovieKey(payload.tmdbId, payload.contentType);
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
   }
-  const banner = await Banner.create(payload);
-  invalidateHomeDataCache();
-  res.json(banner);
+  try {
+    const payload = { ...req.body };
+    if (!String(payload?.imageDataUrl || "").trim()) {
+      res.status(400).json({ error: "Banner image is required." });
+      return;
+    }
+    if (payload.tmdbId) {
+      payload.movieKey = await resolveMovieKey(
+        payload.tmdbId,
+        payload.contentType
+      );
+    }
+    if (!payload.movieKey && payload.tmdbId && payload.contentType) {
+      payload.movieKey = `${payload.contentType}-${payload.tmdbId}`;
+    }
+    const banner = await Banner.create(payload);
+    invalidateHomeDataCache();
+    const lean = banner.toObject ? banner.toObject() : banner;
+    res.json({
+      ...lean,
+      id: lean._id?.toString?.() || lean.id,
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to save banner",
+      message: e?.message ?? String(e),
+    });
+  }
 });
+
+async function deleteBannerById(id, res) {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const bid = String(id || "").trim();
+  if (!bid) {
+    res.status(400).json({ error: "Banner id is required." });
+    return;
+  }
+  try {
+    let deleted = await Banner.findByIdAndDelete(bid);
+    if (!deleted) {
+      deleted = await Banner.findOneAndDelete({ _id: bid });
+    }
+    if (!deleted) {
+      res.json({ ok: true, alreadyDeleted: true, id: bid });
+      return;
+    }
+    invalidateHomeDataCache();
+    res.json({ ok: true, id: bid, revision: homeDataRevision });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to delete banner",
+      message: e?.message ?? String(e),
+    });
+  }
+}
 
 // Delete banner
 app.delete("/api/banner/:id", async (req, res) => {
-  await Banner.findByIdAndDelete(req.params.id);
-  invalidateHomeDataCache();
-  res.json({ ok: true });
+  await deleteBannerById(decodeURIComponent(req.params.id || ""), res);
+});
+
+app.post("/api/banner/delete", async (req, res) => {
+  await deleteBannerById(req.body?.id, res);
 });
 
 // Local video ads (admin upload + player preroll)
@@ -1795,7 +2165,11 @@ app.delete("/api/blog/:id", async (req, res) => {
 const PORT = Number(process.env.PORT) || 3001;
 
 // Open the website when someone visits root.
-app.get("/", (req, res) => {
+app.get("/", async (req, res) => {
+  if ((await getSiteAccessMode()) === "blogs_only") {
+    res.redirect(302, "/blog.html");
+    return;
+  }
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
@@ -1857,9 +2231,18 @@ app.get("/blog/:slug", async (req, res) => {
   const { pageTitle, pageDescription, keywords, image } = buildBlogSeoMeta(blog, req);
   const movieKey =
     blog.movieKey || (await resolveMovieKey(blog.tmdbId, blog.contentType));
+  const accessMode = await getSiteAccessMode();
+  const blogsOnly = accessMode === "blogs_only";
   const playHref = movieKey
     ? `/player.html?key=${encodeURIComponent(movieKey)}`
     : "/";
+  const playBtnHtml = blogsOnly
+    ? ""
+    : `<a class="blog-play-btn" href="${escapeHtml(playHref)}">&#9654; Watch ${escapeHtml(blog.title)} Online</a>`;
+  const navHomeHtml = blogsOnly
+    ? ""
+    : `<a href="/index.html" class="site-blog-link">Home</a>`;
+  const logoHref = blogsOnly ? "/blog.html" : "/index.html";
   const sectionsHtml = renderBlogSectionsHtml(blog, req);
   const intro = String(blog.description || "").trim();
 
@@ -1888,10 +2271,14 @@ app.get("/blog/:slug", async (req, res) => {
       description: pageDescription,
       image,
       url: canonical,
-      potentialAction: {
-        "@type": "WatchAction",
-        target: `${SITE_URL}${playHref}`,
-      },
+      ...(blogsOnly
+        ? {}
+        : {
+            potentialAction: {
+              "@type": "WatchAction",
+              target: `${SITE_URL}${playHref}`,
+            },
+          }),
     },
   ];
 
@@ -1923,10 +2310,10 @@ app.get("/blog/:slug", async (req, res) => {
   <div class="navbar">
     <div class="navbar-container">
       <div class="logo-container">
-        <h1 class="logo"><a href="/index.html" style="color:inherit;text-decoration:none;">ZyroMovies</a></h1>
+        <h1 class="logo"><a href="${logoHref}" style="color:inherit;text-decoration:none;">ZyroMovies</a></h1>
       </div>
       <div class="blog-nav-links">
-        <a href="/index.html" class="site-blog-link">Home</a>
+        ${navHomeHtml}
         <a href="/blog.html" class="site-blog-link">BLOG</a>
       </div>
     </div>
@@ -1936,7 +2323,7 @@ app.get("/blog/:slug", async (req, res) => {
       <a href="/blog.html" class="admin-back-link">&larr; All blogs</a>
       <h1 class="movie-list-title">${escapeHtml(blog.title)}</h1>
       <p class="blog-seo-lead">${escapeHtml(pageDescription)}</p>
-      <a class="blog-play-btn" href="${escapeHtml(playHref)}">&#9654; Watch ${escapeHtml(blog.title)} Online</a>
+      ${playBtnHtml}
       ${intro ? `<div class="blog-detail-intro-wrap"><h2 class="blog-block-label">Intro</h2><p class="blog-detail-description">${escapeHtml(intro)}</p></div>` : ""}
       <div class="blog-detail-sections">${sectionsHtml}</div>
     </article>
@@ -1945,6 +2332,7 @@ app.get("/blog/:slug", async (req, res) => {
     <a href="/blog.html" class="site-blog-link">BLOG</a>
   </footer>
   <script src="/api-config.js"></script>
+  <script src="/site-guard.js"></script>
   <script src="/blog.js"></script>
 </body>
 </html>`;

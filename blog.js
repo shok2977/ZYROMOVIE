@@ -35,6 +35,53 @@ async function fetchSiteData() {
   return await res.json();
 }
 
+let siteAccessMode = "normal";
+
+async function loadSiteAccessMode() {
+  try {
+    const res = await fetch(`${API_BASE}/api/site/mode`);
+    if (!res.ok) return siteAccessMode;
+    const data = await res.json();
+    siteAccessMode =
+      data?.accessMode === "blogs_only" ? "blogs_only" : "normal";
+  } catch (_) {
+    siteAccessMode = "normal";
+  }
+  return siteAccessMode;
+}
+
+function isBlogsOnlyMode() {
+  return siteAccessMode === "blogs_only";
+}
+
+function applyBlogsOnlyChrome() {
+  if (!isBlogsOnlyMode()) return;
+
+  document.body.classList.add("site-blogs-only");
+
+  document.querySelectorAll("a").forEach((link) => {
+    const href = (link.getAttribute("href") || "").trim();
+    const lower = href.toLowerCase();
+    const isHome =
+      lower === "index.html" ||
+      lower === "/index.html" ||
+      lower === "/" ||
+      lower.endsWith("/index.html");
+    if (!isHome) return;
+    const text = (link.textContent || "").trim().toLowerCase();
+    if (text === "home") {
+      link.style.display = "none";
+      return;
+    }
+    link.setAttribute("href", "/blog.html");
+  });
+
+  document.querySelectorAll(".blog-play-wrap, .blog-play-btn").forEach((el) => {
+    el.style.display = "none";
+    el.setAttribute("hidden", "");
+  });
+}
+
 function getBlogExcerpt(blog) {
   if (blog?.description) return blog.description;
   const sections = Array.isArray(blog?.sections) ? blog.sections : [];
@@ -329,6 +376,13 @@ async function setupPlayButton(blog) {
     document.querySelector(".blog-seo-article .blog-play-btn");
   if (!btn) return;
 
+  if (isBlogsOnlyMode()) {
+    if (wrap) wrap.style.display = "none";
+    btn.style.display = "none";
+    btn.removeAttribute("href");
+    return;
+  }
+
   const playUrl = await resolvePlayUrl(blog);
   if (!playUrl) {
     if (wrap) wrap.style.display = "none";
@@ -371,6 +425,9 @@ function renderBlogDetail(blog) {
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
+  await loadSiteAccessMode();
+  applyBlogsOnlyChrome();
+
   const slug = getBlogSlugFromLocation();
 
   try {

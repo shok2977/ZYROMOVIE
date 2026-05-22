@@ -89,6 +89,24 @@
             class="admin-section admin-section-active"
           >
             <h2 class="admin-section-title">Overview</h2>
+
+            <div class="admin-form" style="margin-bottom: 24px; max-width: 520px;">
+              <h3 class="admin-section-subtitle">Public site mode</h3>
+              <p class="admin-help-text" style="margin-bottom: 10px;">
+                <strong>Normal</strong> — full website (home, player, blogs with Play).
+                <strong>Blogs only</strong> — visitors see only the blog list and blog pages; no home, player, or Play button.
+              </p>
+              <label class="admin-label" for="site-access-mode">Mode</label>
+              <select id="site-access-mode" class="admin-input">
+                <option value="normal">1 — Normal (full website)</option>
+                <option value="blogs_only">2 — Blogs only (no home / player)</option>
+              </select>
+              <button type="button" id="site-access-mode-save" class="admin-primary-btn" style="margin-top: 12px;">
+                Save site mode
+              </button>
+              <p id="site-access-mode-status" class="admin-small" style="margin-top: 8px;"></p>
+            </div>
+
             <div class="admin-stats-grid">
               <div class="admin-stat-card">
                 <span class="admin-stat-label">Total Titles</span>
