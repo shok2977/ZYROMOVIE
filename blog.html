@@ -23,10 +23,19 @@
   <meta name="twitter:description" content="Latest movie blogs, reviews and explainers from ZyroMovies." />
   <meta name="twitter:image" content="https://zyromovie.onrender.com/img/1.jpeg" />
   <link rel="canonical" href="https://zyromovie.onrender.com/blog.html" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sen:wght@600;700;800&display=swap"
+    rel="stylesheet"
+  />
   <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="blog.css?v=blog14" />
+  <link rel="stylesheet" href="blog-detail.css?v=blog14" />
   <title>ZyroMovies Blog</title>
 </head>
-<body>
+<body class="blog-page" id="blog-page-body">
+  <div class="blog-read-progress" id="blog-read-progress" aria-hidden="true"></div>
   <div class="navbar">
     <div class="navbar-container">
       <div class="logo-container">
@@ -39,28 +48,43 @@
     </div>
   </div>
 
-  <main class="container">
+  <main class="container blog-post-main">
     <div class="content-container">
-      <section id="blog-list-view">
-        <h1 class="movie-list-title">BLOG</h1>
+      <section id="blog-list-view" class="blog-list-view">
+        <header class="blog-page-header">
+          <p class="blog-page-eyebrow">ZyroMovies</p>
+          <h1 class="blog-page-title">Blog</h1>
+          <p class="blog-page-subtitle">Reviews, guides, and watch-online updates.</p>
+        </header>
         <div id="blog-list" class="blog-grid"></div>
       </section>
-
-      <article id="blog-detail-view" style="display: none;">
-        <a href="blog.html" class="admin-back-link" style="display: inline-block; margin-bottom: 12px;">
-          &larr; Back to all blogs
-        </a>
-        <h1 id="blog-detail-title" class="movie-list-title"></h1>
-        <div id="blog-play-wrap" class="blog-play-wrap" style="display: none;">
-          <a id="blog-play-btn" class="blog-play-btn" href="#">▶ Watch Online</a>
-        </div>
-        <div id="blog-detail-intro-wrap" class="blog-detail-intro-wrap" style="display: none;">
-          <h2 class="blog-block-label">Intro</h2>
-          <p id="blog-detail-description" class="blog-detail-description"></p>
-        </div>
-        <div id="blog-detail-sections" class="blog-detail-sections"></div>
-      </article>
     </div>
+
+    <article id="blog-detail-view" class="blog-post blog-article" style="display: none;">
+      <div class="article-layout">
+        <a href="blog.html" class="article-back">← Back to blog</a>
+        <figure id="blog-post-hero-wrap" class="article-cover" style="display: none;">
+          <img id="blog-post-hero-img" class="article-cover__img" alt="" loading="eager" decoding="async" />
+        </figure>
+        <header class="article-header">
+          <p class="article-meta">
+            <span class="article-meta__brand">ZyroMovies</span><span aria-hidden="true"> · </span>Article
+          </p>
+          <h1 id="blog-detail-title" class="article-title"></h1>
+          <p id="blog-post-info" class="article-info"></p>
+          <div id="blog-play-wrap" class="article-cta-wrap" style="display: none;">
+            <a id="blog-play-btn" class="article-cta" href="#">▶ Start Watching</a>
+          </div>
+        </header>
+        <div class="article-body">
+          <p id="blog-detail-description" class="article-lead" style="display: none;"></p>
+          <div id="blog-detail-sections" class="article-blocks"></div>
+        </div>
+        <footer class="article-foot">
+          <a href="blog.html">← More articles on ZyroMovies</a>
+        </footer>
+      </div>
+    </article>
   </main>
 
   <footer class="site-footer-nav">
@@ -69,6 +93,7 @@
 
   <script src="api-config.js"></script>
   <script src="site-guard.js"></script>
-  <script src="blog.js"></script>
+  <script src="blog.js?v=blog14"></script>
+  <script src="blog-detail-page.js?v=blog14"></script>
 </body>
 </html>

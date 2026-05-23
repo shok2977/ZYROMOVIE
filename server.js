@@ -908,12 +908,59 @@ function buildBlogSeoMeta(blog, req) {
   return { pageTitle, pageDescription, keywords, image, focusPhrase, excerpt };
 }
 
+function stripLegacyBlogLabelText(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  if (/^intro$/i.test(t)) return "";
+  if (/^section\s*\d+$/i.test(t)) return "";
+  if (/^text\s*before\s*image$/i.test(t)) return "";
+  if (/^text\s*after\s*image$/i.test(t)) return "";
+  return text;
+}
+
+function isLikelyBlogHeading(text) {
+  const t = String(text || "").trim();
+  if (!t || t.includes("\n")) return false;
+  return t.length <= 100;
+}
+
+function renderBlogTextHtml(text, { preferHeading = null } = {}) {
+  const trimmed = normalizeBlogParagraph(text);
+  if (!trimmed) return "";
+  const asH2 =
+    preferHeading === true ||
+    (preferHeading !== false && isLikelyBlogHeading(trimmed));
+  const escaped = escapeHtml(trimmed);
+  if (asH2) {
+    return `<h2 class="article-h2">${escaped}</h2>`;
+  }
+  return `<p class="article-p">${escaped}</p>`;
+}
+
+function normalizeBlogParagraph(text) {
+  return stripLegacyBlogLabelText(text).replace(/\n{3,}/g, "\n\n");
+}
+
+function estimateBlogReadMinutes(blog) {
+  const chunks = [blog?.description || ""];
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  sections.forEach((s) => {
+    chunks.push(s?.textBefore || "", s?.textAfter || "");
+  });
+  const words = chunks
+    .join(" ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  return Math.max(1, Math.ceil(words / 200));
+}
+
 function renderBlogSectionsHtml(blog, req) {
   const sections = Array.isArray(blog.sections) ? blog.sections : [];
   return sections
-    .map((section, index) => {
-      const textBefore = String(section?.textBefore || "").trim();
-      const textAfter = String(section?.textAfter || "").trim();
+    .map((section) => {
+      const textBefore = normalizeBlogParagraph(section?.textBefore);
+      const textAfter = normalizeBlogParagraph(section?.textAfter);
       const rawImage = String(
         section?.imageDataUrl || section?.imageUrl || ""
       ).trim();
@@ -921,17 +968,14 @@ function renderBlogSectionsHtml(blog, req) {
       const kind = section?.imageKind === "banner" ? "banner" : "photo";
       if (!textBefore && !textAfter && !imageSrc) return "";
 
-      let html = `<section class="blog-content-block"><h2 class="blog-block-label">Section ${index + 1}</h2>`;
-      if (textBefore) {
-        html += `<div class="blog-text-block"><span class="blog-text-block-label">Text before image</span><p class="blog-detail-text">${escapeHtml(textBefore)}</p></div>`;
-      }
+      let html = "";
+      if (textBefore) html += renderBlogTextHtml(textBefore);
       if (imageSrc) {
-        html += `<figure class="blog-figure blog-figure--${kind}"><img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(blog.title || "Blog")}" loading="lazy" decoding="async" /></figure>`;
+        html += `<figure class="article-figure article-figure--${kind}"><img src="${escapeHtml(imageSrc)}" alt="${escapeHtml(blog.title || "Blog")}" loading="lazy" decoding="async" /></figure>`;
       }
       if (textAfter) {
-        html += `<div class="blog-text-block"><span class="blog-text-block-label">Text after image</span><p class="blog-detail-text">${escapeHtml(textAfter)}</p></div>`;
+        html += renderBlogTextHtml(textAfter, { preferHeading: false });
       }
-      html += `</section>`;
       return html;
     })
     .join("");
@@ -2238,13 +2282,29 @@ app.get("/blog/:slug", async (req, res) => {
     : "/";
   const playBtnHtml = blogsOnly
     ? ""
-    : `<a class="blog-play-btn" href="${escapeHtml(playHref)}">&#9654; Watch ${escapeHtml(blog.title)} Online</a>`;
+    : "";
   const navHomeHtml = blogsOnly
     ? ""
     : `<a href="/index.html" class="site-blog-link">Home</a>`;
   const logoHref = blogsOnly ? "/blog.html" : "/index.html";
   const sectionsHtml = renderBlogSectionsHtml(blog, req);
-  const intro = String(blog.description || "").trim();
+  const intro = normalizeBlogParagraph(blog.description);
+  const publishedAt = blog.createdAt || blog.updatedAt || Date.now();
+  const publishedLabel = new Date(publishedAt).toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+  const heroHtml = image
+    ? `<figure class="article-cover"><img class="article-cover__img" src="${escapeHtml(image)}" alt="${escapeHtml(blog.title || "Blog")}" width="1200" height="630" loading="eager" fetchpriority="high" decoding="async" /></figure>`
+    : "";
+  const readMin = estimateBlogReadMinutes(blog);
+  const infoHtml = publishedLabel
+    ? `${readMin} min read · ${escapeHtml(publishedLabel)}`
+    : `${readMin} min read`;
+  const playBtnArticle = blogsOnly
+    ? ""
+    : `<div class="article-cta-wrap"><a class="article-cta" href="${escapeHtml(playHref)}">▶ Start Watching</a></div>`;
 
   const jsonLd = [
     {
@@ -2303,10 +2363,16 @@ app.get("/blog/:slug", async (req, res) => {
   <meta name="twitter:title" content="${escapeHtml(pageTitle)}" />
   <meta name="twitter:description" content="${escapeHtml(pageDescription)}" />
   <meta name="twitter:image" content="${escapeHtml(image)}" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Sen:wght@600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/blog.css?v=blog14" />
+  <link rel="stylesheet" href="/blog-detail.css?v=blog14" />
   <script type="application/ld+json">${JSON.stringify(jsonLd)}</script>
 </head>
-<body>
+<body class="blog-page blog-page--article">
+  <div class="blog-read-progress" id="blog-read-progress" aria-hidden="true"></div>
   <div class="navbar">
     <div class="navbar-container">
       <div class="logo-container">
@@ -2318,14 +2384,25 @@ app.get("/blog/:slug", async (req, res) => {
       </div>
     </div>
   </div>
-  <main class="container">
-    <article class="content-container blog-seo-article">
-      <a href="/blog.html" class="admin-back-link">&larr; All blogs</a>
-      <h1 class="movie-list-title">${escapeHtml(blog.title)}</h1>
-      <p class="blog-seo-lead">${escapeHtml(pageDescription)}</p>
-      ${playBtnHtml}
-      ${intro ? `<div class="blog-detail-intro-wrap"><h2 class="blog-block-label">Intro</h2><p class="blog-detail-description">${escapeHtml(intro)}</p></div>` : ""}
-      <div class="blog-detail-sections">${sectionsHtml}</div>
+  <main class="container blog-post-main">
+    <article class="blog-post content-container blog-seo-article blog-article">
+      <div class="article-layout">
+        <a href="/blog.html" class="article-back">← Back to blog</a>
+        ${heroHtml}
+        <header class="article-header">
+          <p class="article-meta"><span class="article-meta__brand">ZyroMovies</span><span aria-hidden="true"> · </span>Article</p>
+          <h1 class="article-title">${escapeHtml(blog.title)}</h1>
+          <p class="article-info">${escapeHtml(infoHtml)}</p>
+          ${playBtnArticle}
+        </header>
+        <div class="article-body">
+          ${intro ? `<p class="article-lead">${escapeHtml(intro)}</p>` : ""}
+          <div class="article-blocks">${sectionsHtml}</div>
+        </div>
+        <footer class="article-foot">
+          <a href="/blog.html">← More articles on ZyroMovies</a>
+        </footer>
+      </div>
     </article>
   </main>
   <footer class="site-footer-nav">
@@ -2333,7 +2410,7 @@ app.get("/blog/:slug", async (req, res) => {
   </footer>
   <script src="/api-config.js"></script>
   <script src="/site-guard.js"></script>
-  <script src="/blog.js"></script>
+  <script src="/blog-detail-page.js?v=blog14"></script>
 </body>
 </html>`;
 

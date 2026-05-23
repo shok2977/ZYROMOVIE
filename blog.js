@@ -122,6 +122,78 @@ function normalizeImageKind(kind) {
   return String(kind || "").toLowerCase() === "banner" ? "banner" : "photo";
 }
 
+/** Remove old UI placeholder text if it was saved into the blog body. */
+function stripLegacyBlogLabelText(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  if (/^intro$/i.test(t)) return "";
+  if (/^section\s*\d+$/i.test(t)) return "";
+  if (/^text\s*before\s*image$/i.test(t)) return "";
+  if (/^text\s*after\s*image$/i.test(t)) return "";
+  return t;
+}
+
+function normalizeBlogParagraph(text) {
+  return stripLegacyBlogLabelText(text).replace(/\n{3,}/g, "\n\n");
+}
+
+function estimateBlogReadMinutes(blog) {
+  const chunks = [blog?.description || ""];
+  const sections = Array.isArray(blog?.sections) ? blog.sections : [];
+  sections.forEach((s) => {
+    chunks.push(s?.textBefore || "", s?.textAfter || "");
+  });
+  const words = chunks
+    .join(" ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean).length;
+  return Math.max(1, Math.ceil(words / 200));
+}
+
+function renderBlogPostInfo(blog) {
+  const infoEl = document.getElementById("blog-post-info");
+  if (!infoEl) return;
+  const readMin = estimateBlogReadMinutes(blog);
+  const ts = blog.createdAt || blog.updatedAt;
+  const dateLabel = ts
+    ? new Date(ts).toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      })
+    : "";
+  infoEl.textContent = dateLabel
+    ? `${readMin} min read · ${dateLabel}`
+    : `${readMin} min read`;
+}
+
+/** Short single-line text before an image is shown as a section heading (h2). */
+function isLikelyBlogHeading(text) {
+  const t = String(text || "").trim();
+  if (!t || t.includes("\n")) return false;
+  return t.length <= 100;
+}
+
+function appendBlogTextEl(parent, text, { preferHeading = null } = {}) {
+  const trimmed = normalizeBlogParagraph(text);
+  if (!trimmed) return;
+  const asH2 =
+    preferHeading === true ||
+    (preferHeading !== false && isLikelyBlogHeading(trimmed));
+  const onArticle = document.body.classList.contains("blog-page--article");
+  const el = document.createElement(asH2 ? "h2" : "p");
+  el.className = onArticle
+    ? asH2
+      ? "article-h2"
+      : "article-p"
+    : asH2
+      ? "blog-section-heading"
+      : "blog-detail-text";
+  el.textContent = trimmed;
+  parent.appendChild(el);
+}
+
 function getSiteOrigin() {
   if (API_BASE) return API_BASE.replace(/\/$/, "");
   if (window.location?.origin && window.location.protocol !== "file:") {
@@ -282,11 +354,17 @@ function renderBlogList(blogs) {
     card.className = "blog-card";
     card.href = `/blog/${encodeURIComponent(blog.slug)}`;
     const excerpt = getBlogExcerpt(blog).slice(0, 180);
+    const safeTitle = (blog.title || "Untitled").replace(/</g, "&lt;");
+    const safeExcerpt = excerpt.replace(/</g, "&lt;");
     card.innerHTML = `
-      <img class="blog-card-image" src="${getBlogCardImage(blog)}" alt="${blog.title || "Blog"}" loading="lazy" />
+      <div class="blog-card-media">
+        <img class="blog-card-image" src="${getBlogCardImage(blog)}" alt="${safeTitle}" loading="lazy" decoding="async" />
+        <span class="blog-card-badge">Article</span>
+      </div>
       <div class="blog-card-body">
-        <h2 class="blog-card-title">${blog.title || "Untitled"}</h2>
-        <p class="blog-card-text">${excerpt}</p>
+        <h2 class="blog-card-title">${safeTitle}</h2>
+        <p class="blog-card-text">${safeExcerpt}</p>
+        <span class="blog-card-cta">Read more <span aria-hidden="true">→</span></span>
       </div>
     `;
     listEl.appendChild(card);
@@ -301,9 +379,9 @@ function renderBlogSections(blog) {
   const sections = Array.isArray(blog.sections) ? blog.sections : [];
   if (!sections.length) return;
 
-  sections.forEach((section, index) => {
-    const textBefore = String(section?.textBefore || "").trim();
-    const textAfter = String(section?.textAfter || "").trim();
+  sections.forEach((section) => {
+    const textBefore = normalizeBlogParagraph(section?.textBefore);
+    const textAfter = normalizeBlogParagraph(section?.textAfter);
     const rawImage = String(
       section?.imageDataUrl || section?.imageUrl || ""
     ).trim();
@@ -311,35 +389,18 @@ function renderBlogSections(blog) {
 
     if (!textBefore && !textAfter && !imageSrc) return;
 
-    const block = document.createElement("section");
-    block.className = "blog-content-block";
-
-    const heading = document.createElement("h2");
-    heading.className = "blog-block-label";
-    heading.textContent = `Section ${index + 1}`;
-    block.appendChild(heading);
-
-    if (textBefore) {
-      const beforeWrap = document.createElement("div");
-      beforeWrap.className = "blog-text-block";
-      const beforeLabel = document.createElement("span");
-      beforeLabel.className = "blog-text-block-label";
-      beforeLabel.textContent = "Text before image";
-      const before = document.createElement("p");
-      before.className = "blog-detail-text";
-      before.textContent = textBefore;
-      beforeWrap.appendChild(beforeLabel);
-      beforeWrap.appendChild(before);
-      block.appendChild(beforeWrap);
-    }
+    if (textBefore) appendBlogTextEl(sectionsEl, textBefore);
 
     if (imageSrc) {
       const kind = normalizeImageKind(section.imageKind);
       const figure = document.createElement("figure");
-      figure.className = `blog-figure blog-figure--${kind}`;
+      const onArticle = document.body.classList.contains("blog-page--article");
+      figure.className = onArticle
+        ? `article-figure article-figure--${kind}`
+        : `blog-figure blog-figure--${kind}`;
       const img = document.createElement("img");
       img.src = imageSrc;
-      img.alt = `${blog.title || "Blog"} - ${kind}`;
+      img.alt = blog.title || "Blog image";
       img.loading = "lazy";
       img.decoding = "async";
       img.referrerPolicy = "no-referrer";
@@ -348,24 +409,10 @@ function renderBlogSections(blog) {
         img.alt = "Image failed to load";
       };
       figure.appendChild(img);
-      block.appendChild(figure);
+      sectionsEl.appendChild(figure);
     }
 
-    if (textAfter) {
-      const afterWrap = document.createElement("div");
-      afterWrap.className = "blog-text-block";
-      const afterLabel = document.createElement("span");
-      afterLabel.className = "blog-text-block-label";
-      afterLabel.textContent = "Text after image";
-      const after = document.createElement("p");
-      after.className = "blog-detail-text";
-      after.textContent = textAfter;
-      afterWrap.appendChild(afterLabel);
-      afterWrap.appendChild(after);
-      block.appendChild(afterWrap);
-    }
-
-    sectionsEl.appendChild(block);
+    if (textAfter) appendBlogTextEl(sectionsEl, textAfter, { preferHeading: false });
   });
 }
 
@@ -373,6 +420,7 @@ async function setupPlayButton(blog) {
   const wrap = document.getElementById("blog-play-wrap");
   const btn =
     document.getElementById("blog-play-btn") ||
+    document.querySelector(".blog-seo-article .article-cta") ||
     document.querySelector(".blog-seo-article .blog-play-btn");
   if (!btn) return;
 
@@ -391,9 +439,17 @@ async function setupPlayButton(blog) {
   }
 
   btn.href = playUrl;
-  btn.textContent = `▶ Watch ${blog.title || "Now"} Online`;
+  btn.textContent = "▶ Start Watching";
+  btn.className = "article-cta";
   if (wrap) wrap.style.display = "block";
   else btn.style.display = "";
+}
+
+function isServerRenderedBlogArticle() {
+  return Boolean(
+    document.querySelector(".blog-seo-article .article-blocks") &&
+    !document.getElementById("blog-detail-view")
+  );
 }
 
 function renderBlogDetail(blog) {
@@ -401,8 +457,8 @@ function renderBlogDetail(blog) {
   const detailView = document.getElementById("blog-detail-view");
   const titleEl =
     document.getElementById("blog-detail-title") ||
+    document.querySelector(".blog-article-title") ||
     document.querySelector(".blog-seo-article .movie-list-title");
-  const introWrap = document.getElementById("blog-detail-intro-wrap");
   const descEl =
     document.getElementById("blog-detail-description") ||
     document.querySelector(".blog-detail-description");
@@ -410,15 +466,39 @@ function renderBlogDetail(blog) {
 
   if (!titleEl && !sectionsEl) return;
 
+  // SSR page already has clean HTML — do not replace with JS (avoids stale cached blog.js)
+  if (isServerRenderedBlogArticle()) {
+    if (titleEl) titleEl.textContent = blog.title || "Untitled";
+    updateSeoForDetail(blog);
+    setupPlayButton(blog);
+    return;
+  }
+
+  document.body.classList.add("blog-page--article");
+
   if (listView) listView.style.display = "none";
   if (detailView) detailView.style.display = "block";
 
+  const heroWrap = document.getElementById("blog-post-hero-wrap");
+  const heroImg = document.getElementById("blog-post-hero-img");
+  const heroUrl = getBlogSeoImage(blog);
+  if (heroWrap && heroImg && heroUrl) {
+    heroImg.src = heroUrl;
+    heroImg.alt = blog.title || "Blog cover";
+    heroWrap.style.display = "block";
+  } else if (heroWrap) {
+    heroWrap.style.display = "none";
+  }
+
   if (titleEl) titleEl.textContent = blog.title || "Untitled";
 
-  const intro = blog.description || "";
-  if (descEl) descEl.textContent = intro;
-  if (introWrap) introWrap.style.display = intro ? "block" : "none";
+  const intro = normalizeBlogParagraph(blog.description || "");
+  if (descEl) {
+    descEl.textContent = intro;
+    descEl.style.display = intro ? "block" : "none";
+  }
 
+  renderBlogPostInfo(blog);
   renderBlogSections(blog);
   updateSeoForDetail(blog);
   setupPlayButton(blog);
@@ -436,6 +516,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       renderBlogDetail(blog);
       return;
     }
+    document.body.classList.remove("blog-page--article");
     const blogs = await fetchBlogs();
     renderBlogList(blogs);
   } catch (error) {

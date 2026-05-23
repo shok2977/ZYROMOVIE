@@ -1166,7 +1166,7 @@ async function renderBlogs() {
       <div>${blog.title || "Untitled"}</div>
       <div>TMDB ${blog.tmdbId || "-"}</div>
       <div>${getBlogPreviewText(blog).slice(0, 90)}</div>
-      <div>${Array.isArray(blog.sections) ? blog.sections.length : 0} section(s)</div>
+      <div>${Array.isArray(blog.sections) ? blog.sections.length : 0} block(s)</div>
       <div><a href="../blog/${encodeURIComponent(blog.slug)}" target="_blank" rel="noopener noreferrer">Open</a></div>
       <div><button class="admin-delete-btn" data-blog-id="${blog._id}">Delete</button></div>
     `;
@@ -1713,36 +1713,36 @@ document.addEventListener("DOMContentLoaded", async () => {
     item.dataset.sectionId = String(sectionId);
     item.innerHTML = `
       <div class="blog-section-item-head">
-        <strong>Section ${sectionId}</strong>
+        <span class="blog-block-title" aria-hidden="true">&#9679;</span>
         <button type="button" class="admin-delete-btn blog-section-remove">Remove</button>
       </div>
       <div class="blog-field-group">
-        <label class="admin-label" for="${beforeId}">1. Text before image</label>
-        <textarea id="${beforeId}" class="admin-input blog-section-before" rows="4" placeholder="Write text before the image..."></textarea>
+        <label class="admin-label" for="${beforeId}">Paragraph / heading</label>
+        <textarea id="${beforeId}" class="admin-input blog-section-before" rows="3" placeholder="One short line becomes a heading on the site. Longer text becomes a normal paragraph."></textarea>
       </div>
 
       <div class="blog-field-row">
         <div class="blog-field-group">
-          <label class="admin-label" for="${kindId}">2. Image type</label>
+          <label class="admin-label" for="${kindId}">Image size</label>
           <select id="${kindId}" class="admin-input blog-section-kind">
-            <option value="photo">Photo (portrait / normal)</option>
-            <option value="banner">Banner (full width)</option>
+            <option value="photo">Normal</option>
+            <option value="banner">Full width</option>
           </select>
         </div>
         <div class="blog-field-group blog-field-group--file">
-          <label class="admin-label" for="${fileId}">3. Upload image</label>
+          <label class="admin-label" for="${fileId}">Upload image</label>
           <input id="${fileId}" type="file" class="blog-section-file admin-input" accept="image/*" />
         </div>
       </div>
 
       <p class="blog-section-upload-status admin-small"></p>
       <div class="blog-section-preview-wrap">
-        <img class="blog-section-preview blog-section-preview--photo" alt="Section preview" />
+        <img class="blog-section-preview blog-section-preview--photo" alt="" />
       </div>
 
       <div class="blog-field-group">
-        <label class="admin-label" for="${afterId}">4. Text after image</label>
-        <textarea id="${afterId}" class="admin-input blog-section-after" rows="4" placeholder="Write text after the image..."></textarea>
+        <label class="admin-label" for="${afterId}">More text</label>
+        <textarea id="${afterId}" class="admin-input blog-section-after" rows="4" placeholder="Add more article text here..."></textarea>
       </div>
     `;
 
@@ -2146,7 +2146,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!hasIntro && !hasSectionContent) {
         if (addBlogError) {
           addBlogError.textContent =
-            "Add intro text or at least one photo/banner section.";
+            "Add an opening paragraph or at least one content block with text or image.";
         }
         return;
       }

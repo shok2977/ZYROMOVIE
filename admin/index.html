@@ -397,8 +397,8 @@
           <section id="blogs-section" class="admin-section">
             <h2 class="admin-section-title">Create Blog</h2>
             <p class="admin-help-text">
-              Title and banner are fetched from the TMDB ID. Write the intro below, then add as many
-              photo/banner sections as you like — each section can have text before and after the image.
+              TMDB se title aata hai. Neeche paragraph likho, phir + se image aur text add karo — site par
+              normal blog article ki tarah dikhega (koi Intro/Section label nahi).
             </p>
             <form id="add-blog-form" class="admin-form">
               <label class="admin-label" for="blog-tmdb-id">TMDB ID</label>
@@ -416,14 +416,13 @@
               </select>
 
               <div class="blog-intro-panel">
-                <h3 class="blog-panel-title">Intro text (top of blog)</h3>
                 <div class="blog-field-group">
-                  <label class="admin-label" for="blog-description">Opening paragraph</label>
+                  <label class="admin-label" for="blog-description">Opening paragraph (title ke neeche)</label>
                   <textarea
                     id="blog-description"
                     class="admin-input"
                     rows="4"
-                    placeholder="Write the opening paragraph here..."
+                    placeholder="Pehla paragraph yahan likho..."
                   ></textarea>
                 </div>
               </div>
@@ -443,9 +442,9 @@
 
               <div class="blog-sections-builder">
                 <div class="blog-sections-builder-head">
-                  <h3 class="blog-panel-title">Photo / Banner sections</h3>
+                  <p class="blog-builder-hint">Image + text blocks</p>
                   <button type="button" id="add-blog-section-btn" class="admin-secondary-btn">
-                    + Add section
+                    + Add block
                   </button>
                 </div>
                 <div id="blog-sections-list" class="blog-sections-list"></div>
@@ -513,7 +512,7 @@
     </div>
 
     <script src="../api-config.js"></script>
-    <script src="../admin.js"></script>
+    <script src="../admin.js?v=blog3"></script>
   </body>
 </html>
 
