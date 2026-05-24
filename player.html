@@ -22,6 +22,7 @@
     <meta name="twitter:image" content="https://zyromovie.onrender.com/img/1.jpeg" />
     <title>Watch Online | Zyro Movie</title>
     <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="player.css?v=player1" />
     <link
       href="https://fonts.googleapis.com/css2?family=Roboto:wght@100;300;400;500;700;900&family=Sen:wght@400;700;800&display=swap"
       rel="stylesheet"
@@ -44,50 +45,11 @@
     />
     <script src="https://cdn.jsdelivr.net/npm/videojs-ima@2/dist/videojs.ima.min.js"></script>
     <style>
-      #player-box video,
-      #player-box iframe {
-        width: 100%;
-        height: 500px;
-        border: 0;
-      }
+      /* Preroll layer order — keep in HTML for ad stack */
       #player-box .zyro-preroll-video {
         display: block;
-        width: 100%;
-        height: 500px;
-        object-fit: contain;
-        background: #000;
         position: relative;
         z-index: 0;
-      }
-      /* Local / HTML5 preroll: skip must paint above native video compositor layer */
-      #player-box .zyro-preroll-skip {
-        position: absolute;
-        z-index: 100;
-        pointer-events: auto;
-      }
-      /* Video.js + IMA: fill player area (linear + many VPAID creatives) */
-      #player-box .video-js {
-        width: 100% !important;
-        height: 500px !important;
-      }
-      #player-box .vjs-tech {
-        width: 100% !important;
-        height: 500px !important;
-        object-fit: contain;
-      }
-      #player-box .ima-ad-container,
-      #player-box .ima-ad-container iframe {
-        max-width: 100% !important;
-      }
-      @media only screen and (max-width: 940px) {
-        #player-box video,
-        #player-box iframe,
-        #player-box .zyro-preroll-video,
-        #player-box .video-js,
-        #player-box .vjs-tech {
-          height: 220px !important;
-          max-height: 56vw;
-        }
       }
     </style>
     <script type="application/ld+json">
@@ -110,7 +72,7 @@
     <div class="navbar">
       <div class="navbar-container">
         <div class="logo-container">
-          <a href="index.html" style="text-decoration: none; color: rgb(0, 0, 0);">
+          <a href="index.html">
           <h1 class="logo">ZyroMovies</h1></a>
         </div>
         <div class="menu-container">

@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Alternate Language | ZyroMovies</title>
     <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="player.css?v=player1" />
     <link
       href="https://fonts.googleapis.com/css2?family=Roboto:wght@100;300;400;500;700;900&family=Sen:wght@400;700;800&display=swap"
       rel="stylesheet"
@@ -14,36 +15,12 @@
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.2/css/all.min.css"
     />
-    <style>
-      /* Make injected Fluid Player responsive */
-      #fluid-player-container {
-        width: 100%;
-        max-width: 100%;
-      }
-      #fluid-player-container video,
-      #fluid-player-container iframe,
-      #fluid-player-container .fluid_video_wrapper,
-      #fluid-player-container .fluid_video_wrapper video {
-        width: 100% !important;
-        max-width: 100% !important;
-        height: auto !important;
-      }
-      @media only screen and (max-width: 940px) {
-        #fluid-player-container video,
-        #fluid-player-container iframe,
-        #fluid-player-container .fluid_video_wrapper,
-        #fluid-player-container .fluid_video_wrapper video {
-          height: 220px !important;
-          max-height: 56vw;
-        }
-      }
-    </style>
   </head>
-  <body class="player-body">
+  <body class="player-body player-alt">
     <div class="navbar">
       <div class="navbar-container">
         <div class="logo-container">
-          <a href="index.html" style="text-decoration: none; color: black;">
+          <a href="index.html">
             <h1 class="logo">ZyroMovies</h1>
           </a>
         </div>

@@ -106,7 +106,10 @@ function normalizeHomeData(data) {
   const listsRaw = data?.lists || {};
   const lists = {};
   Object.keys(listsRaw).forEach((name) => {
-    lists[name] = (listsRaw[name] || []).filter((k) => movies[k]);
+    lists[name] = (listsRaw[name] || []).filter((k) => {
+      const movie = movies[k];
+      return movie && !isExcludedFromCustomLists(movie);
+    });
   });
   const banners = (Array.isArray(data?.banners) ? data.banners : []).map(
     (b) => ({
@@ -200,6 +203,21 @@ function loadMovieDataLocal() {
   }
 }
 
+/** Keep browser localStorage in sync with MongoDB so deleted titles do not reappear on the site. */
+function writeLocalStorageFromApiData(data) {
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        movies: data?.movies || {},
+        lists: data?.lists || {},
+        banners: data?.banners || [],
+        listOrder: Array.isArray(data?.listOrder) ? data.listOrder : [],
+      })
+    );
+  } catch (_) {}
+}
+
 async function fetchAllDataPreferApi() {
   if (homeDataInflight) return homeDataInflight;
 
@@ -207,17 +225,18 @@ async function fetchAllDataPreferApi() {
     try {
       const data = await fetchAllDataFromApiWithRetry();
       const normalized = await enrichHomeDataWithBanners(data);
-      if (Object.keys(normalized.movies).length > 0) {
+      if (data?.dbReady === true) {
         writeHomeDataCache(normalized);
+        writeLocalStorageFromApiData(normalized);
+        return normalized;
+      }
+      if (Object.keys(normalized.movies || {}).length > 0) {
+        writeHomeDataCache(normalized);
+        writeLocalStorageFromApiData(normalized);
         return normalized;
       }
     } catch (err) {
       console.warn("API unavailable:", err);
-    }
-
-    const local = loadMovieDataLocal();
-    if (local?.movies && Object.keys(local.movies).length > 0) {
-      return normalizeHomeData(local);
     }
 
     const cached = readHomeDataCache();
@@ -225,11 +244,17 @@ async function fetchAllDataPreferApi() {
       return normalizeHomeData(cached);
     }
 
+    const local = loadMovieDataLocal();
+    if (local?.movies && Object.keys(local.movies).length > 0) {
+      return normalizeHomeData(local);
+    }
+
     try {
       const data = await fetchAllDataFromApiWithRetry(3);
       const normalized = await enrichHomeDataWithBanners(data);
-      if (Object.keys(normalized.movies).length > 0) {
+      if (data?.dbReady === true || Object.keys(normalized.movies || {}).length > 0) {
         writeHomeDataCache(normalized);
+        writeLocalStorageFromApiData(normalized);
       }
       return normalized;
     } catch (_) {
@@ -260,6 +285,10 @@ function isReservedRandomListName(name) {
   if (/^Random$/i.test(t)) return true;
   if (/^Random\s+\d+$/i.test(t)) return true;
   return false;
+}
+
+function isExcludedFromCustomLists(movie) {
+  return movie?.excludeFromLists === true;
 }
 
 function shuffleArray(arr) {
@@ -498,8 +527,12 @@ async function renderDynamicLists(dataIn) {
   const listNames = getOrderedCustomListNames(data);
 
   listNames.forEach((listName) => {
-    let movieIds = (data.lists[listName] || []).filter((k) => movies[k]);
+    let movieIds = (data.lists[listName] || []).filter((k) => {
+      const movie = movies[k];
+      return movie && !isExcludedFromCustomLists(movie);
+    });
     movieIds = shuffleArray(movieIds);
+    if (!movieIds.length) return;
     appendMovieListSection(root, data, listName, movieIds);
   });
 

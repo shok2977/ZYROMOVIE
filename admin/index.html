@@ -125,7 +125,10 @@
               </div>
             </div>
 
-            <h3 class="admin-section-subtitle">Recent Titles</h3>
+            <h3 class="admin-section-subtitle">All titles in library</h3>
+            <p class="admin-help-text">
+              Delete removes the title from the database and the public site (search, Random, lists). Titles added with <strong>Search &amp; Random only</strong> are marked below — use <strong>Delete</strong> here (deleting a list does not remove them).
+            </p>
             <div id="admin-recent-list" class="admin-table">
               <!-- filled by JS -->
             </div>
@@ -223,13 +226,30 @@
                 Search tags (auto from TMDB): <span id="tmdb-tags-preview-text"></span>
               </p>
 
-              <label class="admin-label" for="assign-list">Assign to list</label>
-              <select id="assign-list" class="admin-input">
-                <!-- populated by JS -->
-              </select>
-              <p class="admin-small">
-                Create lists in the "Lists" tab first (Anime, New Releases, etc.).
-              </p>
+              <label
+                class="admin-label"
+                for="exclude-from-lists"
+                style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-weight: 500;"
+              >
+                <input
+                  id="exclude-from-lists"
+                  type="checkbox"
+                  style="margin-top: 3px; width: auto;"
+                />
+                <span>
+                  Search &amp; Random only — do not add to any list (users find it via search or Random rows)
+                </span>
+              </label>
+
+              <div id="assign-list-fields">
+                <label class="admin-label" for="assign-list">Assign to list</label>
+                <select id="assign-list" class="admin-input">
+                  <!-- populated by JS -->
+                </select>
+                <p class="admin-small">
+                  Create lists in the "Lists" tab first (Anime, New Releases, etc.).
+                </p>
+              </div>
 
               <button type="submit" class="admin-primary-btn">
                 Save Title

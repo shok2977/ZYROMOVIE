@@ -45,10 +45,29 @@ async function adminFetch(path, options = {}, timeoutMs = 45000) {
   }
 }
 
+const HOME_DATA_CLIENT_CACHE_KEY = "flakes_home_data_v5";
+
 function signalHomePageRefresh() {
   try {
     localStorage.setItem(HOME_INVALIDATE_KEY, String(Date.now()));
+    sessionStorage.removeItem(HOME_DATA_CLIENT_CACHE_KEY);
   } catch (_) {}
+}
+
+async function syncLocalStorageWithServerData() {
+  await refreshData();
+  try {
+    localStorage.setItem(
+      LOCAL_STORAGE_KEY,
+      JSON.stringify({
+        movies: cachedData.movies || {},
+        lists: cachedData.lists || {},
+        banners: cachedData.banners || [],
+        listOrder: Array.isArray(cachedData.listOrder) ? cachedData.listOrder : [],
+      })
+    );
+  } catch (_) {}
+  signalHomePageRefresh();
 }
 
 function patchLocalStorageAfterMovieDelete(key) {
@@ -92,11 +111,25 @@ function listNameMatches(a, b) {
   return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase();
 }
 
-function patchLocalStorageAfterListDelete(name) {
+function patchLocalStorageAfterListDelete(name, movieKeys) {
   try {
     const raw = localStorage.getItem(LOCAL_STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw);
+    const keys = Array.isArray(movieKeys) ? movieKeys : [];
+    keys.forEach((key) => {
+      if (parsed?.movies?.[key]) delete parsed.movies[key];
+      if (parsed?.lists) {
+        Object.keys(parsed.lists).forEach((listName) => {
+          parsed.lists[listName] = (parsed.lists[listName] || []).filter(
+            (k) => k !== key
+          );
+        });
+      }
+      if (Array.isArray(parsed.banners)) {
+        parsed.banners = parsed.banners.filter((b) => b?.movieKey !== key);
+      }
+    });
     if (parsed?.lists) {
       Object.keys(parsed.lists).forEach((listName) => {
         if (listNameMatches(listName, name)) {
@@ -109,6 +142,31 @@ function patchLocalStorageAfterListDelete(name) {
     }
     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(parsed));
   } catch (_) {}
+}
+
+function getListMovieKeysFromCache(listName) {
+  return getListMoviesFromCache(listName).map((m) => m.key).filter(Boolean);
+}
+
+function getListMoviesFromCache(listName) {
+  const out = [];
+  const seen = new Set();
+  Object.keys(cachedData.lists || {}).forEach((n) => {
+    if (!listNameMatches(n, listName)) return;
+    (cachedData.lists[n] || []).forEach((k) => {
+      const key = String(k || "").trim();
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      const movie = cachedData.movies?.[key] || {};
+      out.push({
+        key,
+        tmdbId: movie.tmdbId != null ? String(movie.tmdbId) : "",
+        type: movie.type != null ? String(movie.type) : "",
+        title: movie.title != null ? String(movie.title) : "",
+      });
+    });
+  });
+  return out;
 }
 
 function reconcileCachedLists() {
@@ -146,7 +204,7 @@ async function syncListsCacheFromApi() {
   return cachedData;
 }
 
-function patchCacheAfterListDelete(name) {
+function patchCacheAfterListDelete(name, deletedMovieKeys) {
   const trimmed = String(name || "").trim();
   if (!trimmed) return;
   Object.keys(cachedData.lists || {}).forEach((listName) => {
@@ -159,8 +217,13 @@ function patchCacheAfterListDelete(name) {
       (n) => !listNameMatches(n, trimmed)
     );
   }
+  const keys = Array.isArray(deletedMovieKeys) ? deletedMovieKeys : [];
+  keys.forEach((key) => {
+    if (cachedData.movies) delete cachedData.movies[key];
+    patchLocalStorageAfterMovieDelete(key);
+  });
   reconcileCachedLists();
-  patchLocalStorageAfterListDelete(trimmed);
+  patchLocalStorageAfterListDelete(trimmed, keys);
   signalHomePageRefresh();
 }
 
@@ -233,34 +296,77 @@ async function upsertMovie(movie) {
   return data;
 }
 
-async function deleteMovie(key) {
-  const trimmed = String(key || "").trim();
-  if (!trimmed) throw new Error("Movie key is missing.");
+function movieDeletePayload(key, movie) {
+  const m = movie || {};
+  return {
+    key: String(key || m.key || "").trim(),
+    tmdbId: m.tmdbId != null ? String(m.tmdbId) : "",
+    type: m.type != null ? String(m.type) : "",
+    title: m.title != null ? String(m.title) : "",
+  };
+}
 
-  let res = await adminFetch(`/api/movie/${encodeURIComponent(trimmed)}`, {
-    method: "DELETE",
-  }, 20000);
-
-  if (res.status === 403 || res.status === 405) {
-    res = await adminFetch(
-      "/api/movie/delete",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ key: trimmed }),
-      },
-      20000
-    );
-  }
-
+async function purgeMovieFromDb(payload) {
+  const res = await adminFetch(
+    "/api/movie/purge",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+    20000
+  );
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(
-      data.error || data.message || `Failed to delete movie (HTTP ${res.status})`
+      data.error || data.message || `Failed to delete from database (HTTP ${res.status})`
     );
   }
-  patchCacheAfterMovieDelete(trimmed);
+  const keys = Array.isArray(data.deletedKeys)
+    ? data.deletedKeys
+    : [data.key].filter(Boolean);
+  keys.forEach((k) => patchCacheAfterMovieDelete(k));
+  if (payload.key) patchCacheAfterMovieDelete(payload.key);
+  await syncLocalStorageWithServerData();
   return data;
+}
+
+async function deleteMovie(key, movieHint) {
+  const trimmed = String(key || "").trim();
+  const movie =
+    movieHint ||
+    cachedData.movies?.[trimmed] ||
+    (trimmed ? { key: trimmed } : {});
+  const deleteBody = movieDeletePayload(trimmed || movie.key, movie);
+
+  if (!deleteBody.key && !deleteBody.title && !deleteBody.tmdbId) {
+    throw new Error("Movie key or title is missing.");
+  }
+
+  try {
+    return await purgeMovieFromDb(deleteBody);
+  } catch (purgeErr) {
+    let res = await adminFetch(
+      `/api/movie/${encodeURIComponent(deleteBody.key || trimmed)}`,
+      { method: "DELETE" },
+      20000
+    );
+    if (res.status === 403 || res.status === 405 || res.status === 404) {
+      res = await adminFetch(
+        "/api/movie/delete",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(deleteBody),
+        },
+        20000
+      );
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw purgeErr;
+    if (deleteBody.key) patchCacheAfterMovieDelete(deleteBody.key);
+    return data;
+  }
 }
 
 async function upsertList(name) {
@@ -276,24 +382,66 @@ async function upsertList(name) {
   return data;
 }
 
-async function deleteList(name) {
+async function requestListDeleteApi(trimmed, entries) {
+  const movieKeys = (entries || []).map((e) => e.key).filter(Boolean);
+  const payload = { name: trimmed, movieKeys, movies: entries || [] };
+  const attempts = [
+    {
+      path: "/api/list",
+      body: { ...payload, action: "delete" },
+    },
+    {
+      path: "/api/list/delete",
+      body: payload,
+    },
+  ];
+
+  let lastRes = null;
+  let lastRaw = "";
+  let lastData = {};
+
+  for (const attempt of attempts) {
+    const res = await adminFetch(
+      attempt.path,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(attempt.body),
+      },
+      20000
+    );
+    const raw = await res.text();
+    let data = {};
+    try {
+      data = raw ? JSON.parse(raw) : {};
+    } catch (_) {}
+
+    lastRes = res;
+    lastRaw = raw;
+    lastData = data;
+
+    if (res.ok) return { res, raw, data };
+    if (res.status !== 404) break;
+  }
+
+  return { res: lastRes, raw: lastRaw, data: lastData };
+}
+
+async function deleteList(name, entriesSnapshot) {
   const trimmed = String(name || "").trim();
   if (!trimmed) throw new Error("List name is required.");
 
-  const res = await adminFetch("/api/list", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: trimmed, action: "delete" }),
-  }, 20000);
-  const raw = await res.text();
-  let data = {};
-  try {
-    data = raw ? JSON.parse(raw) : {};
-  } catch (_) {}
+  const entries =
+    Array.isArray(entriesSnapshot) && entriesSnapshot.length
+      ? entriesSnapshot
+      : getListMoviesFromCache(trimmed);
+  const { res, raw, data } = await requestListDeleteApi(trimmed, entries);
 
   if (res.status === 404) {
-    patchCacheAfterListDelete(trimmed);
-    return { ok: true, alreadyDeleted: true };
+    await deleteMoviesFallback(entries);
+    const keys = entries.map((e) => e.key).filter(Boolean);
+    patchCacheAfterListDelete(trimmed, keys);
+    return { ok: true, alreadyDeleted: true, deletedMovieKeys: keys };
   }
 
   if (!res.ok) {
@@ -306,8 +454,61 @@ async function deleteList(name) {
           : `List delete failed (HTTP ${res.status})`)
     );
   }
-  patchCacheAfterListDelete(trimmed);
-  return data;
+
+  const reported = Array.isArray(data.deletedMovieKeys)
+    ? data.deletedMovieKeys
+    : [];
+  const entryKeys = entries.map((e) => e.key).filter(Boolean);
+  const mergedKeys = [...new Set([...entryKeys, ...reported])];
+  const deletedCount = Number(data.deletedMovieCount) || 0;
+
+  if (entries.length > 0 && deletedCount === 0) {
+    await deleteMoviesFallback(entries);
+  } else {
+    const stillPresent = entries.filter(
+      (e) => e.key && cachedData.movies?.[e.key]
+    );
+    if (stillPresent.length) {
+      await deleteMoviesFallback(stillPresent);
+    }
+  }
+
+  patchCacheAfterListDelete(trimmed, mergedKeys);
+  await syncLocalStorageWithServerData().catch((e) =>
+    console.warn("Sync after list delete:", e)
+  );
+  return { ...data, deletedMovieKeys: mergedKeys };
+}
+
+async function deleteMoviesFallback(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  for (const entry of list) {
+    const key = String(entry?.key || entry || "").trim();
+    if (!key && !entry?.title && !entry?.tmdbId) continue;
+    try {
+      const res = await adminFetch(
+        "/api/movie/delete",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(
+            typeof entry === "object"
+              ? entry
+              : { key: String(entry || "").trim() }
+          ),
+        },
+        20000
+      );
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(payload.error || `HTTP ${res.status}`);
+      }
+      if (key) patchCacheAfterMovieDelete(key);
+    } catch (err) {
+      console.warn("Could not delete movie after list delete:", entry, err);
+    }
+  }
+  await syncLocalStorageWithServerData().catch(() => {});
 }
 
 async function assignMovieToList(name, key) {
@@ -673,29 +874,42 @@ function renderDashboard() {
     <div>Title</div>
     <div>Type</div>
     <div>TMDB ID</div>
-    <div>Seasons/Episodes</div>
+    <div>Lists</div>
     <div></div>
   `;
   table.appendChild(header);
 
-  const recentKeys = movieKeys.slice(-10).reverse();
-  recentKeys.forEach((key) => {
+  const sortedKeys = movieKeys.slice().sort((a, b) => {
+    const ta = Number(data.movies[a]?.createdAt) || 0;
+    const tb = Number(data.movies[b]?.createdAt) || 0;
+    return tb - ta;
+  });
+
+  sortedKeys.forEach((key) => {
     const m = data.movies[key];
-    let epInfo = "-";
-    if ((m.type === "tv" || m.type === "anime") && m.seasons && m.seasons.length) {
-      const total = m.seasons.reduce((s, x) => s + (x.episodes ? x.episodes.length : 0), 0);
-      epInfo = `${m.seasons.length} S · ${total} E`;
-    }
+    const searchOnly = m.excludeFromLists === true;
+    const listLabel = searchOnly
+      ? '<span style="color:#ff9f43;">Search &amp; Random only</span>'
+      : (() => {
+          const names = [];
+          Object.keys(data.lists || {}).forEach((listName) => {
+            if ((data.lists[listName] || []).includes(key)) names.push(listName);
+          });
+          return names.length ? names.join(", ") : "—";
+        })();
     const row = document.createElement("div");
     row.className = "admin-table-row";
     row.innerHTML = `
       <div>${m.title || "Untitled"}</div>
       <div>${m.type || "-"}</div>
       <div>${m.tmdbId || "-"}</div>
-      <div>${epInfo}</div>
+      <div style="font-size:12px;">${listLabel}</div>
       <div>
         <button class="admin-secondary-btn admin-edit-btn" data-key="${key}">Edit</button>
-        <button class="admin-delete-btn" data-key="${key}">Delete</button>
+        <button class="admin-delete-btn" data-key="${key}"
+          data-title="${String(m.title || "").replace(/"/g, "&quot;")}"
+          data-tmdb-id="${String(m.tmdbId || "")}"
+          data-type="${String(m.type || "")}">Delete</button>
       </div>
     `;
     table.appendChild(row);
@@ -914,15 +1128,25 @@ function renderLists() {
     delBtn.addEventListener("click", async () => {
       const msg =
         count > 0
-          ? `Delete list "${name}"? Its ${count} title(s) will stay on the site — only the list is removed.`
+          ? `Delete list "${name}" and all ${count} title(s) in it? This cannot be undone.`
           : `Delete list "${name}"?`;
       if (!confirm(msg)) return;
       delBtn.disabled = true;
+      const titlesSnapshot = getListMoviesFromCache(name);
       try {
-        await deleteList(name);
+        const result = await deleteList(name, titlesSnapshot);
+        const removed =
+          Number(result?.deletedMovieCount) ||
+          result?.deletedMovieKeys?.length ||
+          0;
         await refreshAssignListSelect();
         renderLists();
         renderDashboard();
+        if (count > 0 && removed === 0) {
+          alert(
+            `List "${name}" was removed but titles could not be deleted from the database. Restart the server (node server.js), then delete the title manually from Overview — or try deleting the list again.`
+          );
+        }
       } catch (e) {
         console.error(e);
         alert(e?.message || "Could not delete list.");
@@ -1412,6 +1636,14 @@ async function fetchTmdbMetaForAdd(tmdbIdRaw, preferredType) {
   }
 }
 
+function syncAssignListFieldsVisibility() {
+  const exclude = document.getElementById("exclude-from-lists");
+  const fields = document.getElementById("assign-list-fields");
+  if (!fields) return;
+  const hide = exclude?.checked === true;
+  fields.style.display = hide ? "none" : "";
+}
+
 function renderAssignListOptions(listNames) {
   const select = document.getElementById("assign-list");
   if (!select) return false;
@@ -1534,6 +1766,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   const editLangAddBtn = document.getElementById("edit-movie-add-language");
   const editLangSaveBtn = document.getElementById("edit-movie-save");
   const editLangCancelBtn = document.getElementById("edit-movie-cancel");
+  const excludeFromListsCheckbox = document.getElementById("exclude-from-lists");
+  if (excludeFromListsCheckbox) {
+    excludeFromListsCheckbox.addEventListener("change", syncAssignListFieldsVisibility);
+    syncAssignListFieldsVisibility();
+  }
 
   const siteAccessModeSaveBtn = document.getElementById("site-access-mode-save");
   if (siteAccessModeSaveBtn) {
@@ -1546,6 +1783,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (loginCard) loginCard.style.display = "none";
     if (panel) panel.style.display = "flex";
     await refreshData();
+    await syncLocalStorageWithServerData().catch(console.error);
     await maybeMigrateLocalToApi();
     await ensureDefaultListsInApi();
     renderDashboard();
@@ -1568,7 +1806,8 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (loginCard) loginCard.style.display = "none";
         if (panel) panel.style.display = "flex";
         await refreshData();
-      await maybeMigrateLocalToApi();
+        await syncLocalStorageWithServerData().catch(console.error);
+        await maybeMigrateLocalToApi();
         await ensureDefaultListsInApi();
         renderDashboard();
         await loadSiteAccessModeAdmin();
@@ -2210,12 +2449,24 @@ document.addEventListener("DOMContentLoaded", async () => {
       const key = btn ? btn.getAttribute("data-key") : null;
 
       if (btn && btn.classList?.contains("admin-delete-btn")) {
-        const delKey = btn.getAttribute("data-key");
-        if (!delKey) return;
-        if (!confirm(`Delete "${delKey}" from the library?`)) return;
+        const delKey = btn.getAttribute("data-key") || "";
+        const delTitle = btn.getAttribute("data-title") || delKey;
+        const hint = {
+          key: delKey,
+          title: delTitle,
+          tmdbId: btn.getAttribute("data-tmdb-id") || "",
+          type: btn.getAttribute("data-type") || "",
+        };
+        if (!delKey && !delTitle) return;
+        if (
+          !confirm(
+            `Permanently delete "${delTitle}" from the database and website?`
+          )
+        )
+          return;
         btn.disabled = true;
         try {
-          await deleteMovie(delKey);
+          await deleteMovie(delKey, hint);
           renderDashboard();
           renderLists();
         } catch (err) {
@@ -2254,6 +2505,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       const tmdbId = parseTmdbIdInput(tmdbIdRaw) || tmdbIdRaw;
       const selectedType =
         document.getElementById("content-type")?.value || "movie";
+      const excludeFromLists =
+        document.getElementById("exclude-from-lists")?.checked === true;
       const listName = document.getElementById("assign-list")?.value || "";
       const sourceKind =
         document.getElementById("source-kind")?.value || "vidsrc";
@@ -2271,9 +2524,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         return;
       }
 
-      if (!listName) {
+      if (!excludeFromLists && !listName) {
         addTitleError.textContent =
-          'Choose a list under "Assign to list". You can create a new list in the Lists tab.';
+          'Choose a list under "Assign to list", or tick "Search & Random only".';
         return;
       }
 
@@ -2348,6 +2601,9 @@ document.addEventListener("DOMContentLoaded", async () => {
         posterUrl: meta.posterUrl,
         seasons: seasons.length ? seasons : null,
         sourceKind,
+        excludeFromLists,
+        memberOfLists:
+          !excludeFromLists && listName ? [listName] : [],
         createdAt: Date.now(),
       };
 
@@ -2390,18 +2646,22 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
 
-        await upsertList(listName);
+        if (!excludeFromLists) {
+          await upsertList(listName);
+          await assignMovieToList(listName, key);
+        }
         await upsertMovie(movieRecord);
-        await assignMovieToList(listName, key);
 
         cachedData.movies = cachedData.movies || {};
         cachedData.movies[key] = movieRecord;
-        cachedData.lists = cachedData.lists || {};
-        if (!Array.isArray(cachedData.lists[listName])) {
-          cachedData.lists[listName] = [];
-        }
-        if (!cachedData.lists[listName].includes(key)) {
-          cachedData.lists[listName].push(key);
+        if (!excludeFromLists) {
+          cachedData.lists = cachedData.lists || {};
+          if (!Array.isArray(cachedData.lists[listName])) {
+            cachedData.lists[listName] = [];
+          }
+          if (!cachedData.lists[listName].includes(key)) {
+            cachedData.lists[listName].push(key);
+          }
         }
         renderDashboard();
         renderLists();
@@ -2411,7 +2671,12 @@ document.addEventListener("DOMContentLoaded", async () => {
         if (tmdbInput) tmdbInput.value = "";
         const scriptInput = document.getElementById("download-fluid-script");
         if (scriptInput) scriptInput.value = "";
-        addTitleSuccess.textContent = `"${meta.title}" saved — it will appear on the home page in list "${listName}".`;
+        const excludeCheckbox = document.getElementById("exclude-from-lists");
+        if (excludeCheckbox) excludeCheckbox.checked = false;
+        syncAssignListFieldsVisibility();
+        addTitleSuccess.textContent = excludeFromLists
+          ? `"${meta.title}" saved — search & Random rows only (not in any list).`
+          : `"${meta.title}" saved — it will appear on the home page in list "${listName}".`;
       } catch (err) {
         console.error(err);
         addTitleError.textContent =

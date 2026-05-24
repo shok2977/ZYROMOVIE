@@ -354,6 +354,9 @@ async function connectMongoWithRetry() {
       backfillMovieTagsInBackground().catch((e) => {
         console.warn("Tag backfill:", e?.message ?? e);
       });
+      repairListMembershipFromListDocs().catch((e) => {
+        console.warn("List membership repair:", e?.message ?? e);
+      });
       return;
     } catch (err) {
       console.error(
@@ -405,6 +408,10 @@ const movieSchema = new mongoose.Schema({
   languages: Array,
   downloadEpisodes: Object,
   downloadEpisodesByLang: Object,
+  /** When true: not shown in custom lists; still in search + Random rows */
+  excludeFromLists: { type: Boolean, default: false },
+  /** List names this title belongs to (for cascade delete when a list is removed) */
+  memberOfLists: { type: [String], default: [] },
   createdAt: Number,
 });
 
@@ -559,6 +566,7 @@ async function blogsOnlyGate(req, res, next) {
     if (
       p === "/api/site/mode" ||
       p === "/api/lists" ||
+      p.startsWith("/api/admin/") ||
       p.startsWith("/api/blogs") ||
       /^\/api\/blog\/[^/]+$/.test(p) ||
       p === "/api/health"
@@ -993,6 +1001,9 @@ app.get("/api/health", async (req, res) => {
     features: {
       localAds: true,
       listDelete: true,
+      listDeleteDeletesMovies: true,
+      moviePurgeApi: true,
+      movieMemberOfLists: true,
       siteAccessMode: true,
       listsApi: true,
       bannerDelete: true,
@@ -1106,7 +1117,12 @@ function invalidateHomeDataCache() {
 function pruneListsToExistingMovies(listsByName, moviesByKey) {
   const out = {};
   Object.keys(listsByName || {}).forEach((name) => {
-    out[name] = (listsByName[name] || []).filter((k) => moviesByKey[k]);
+    out[name] = (listsByName[name] || []).filter((k) => {
+      const movie = moviesByKey[k];
+      if (!movie) return false;
+      if (movie.excludeFromLists === true) return false;
+      return true;
+    });
   });
   return out;
 }
@@ -1131,6 +1147,7 @@ function movieForHomeClient(doc) {
     tags: doc.tags,
     posterUrl: doc.posterUrl,
     sourceKind: doc.sourceKind,
+    excludeFromLists: doc.excludeFromLists === true,
   };
 }
 
@@ -1160,7 +1177,7 @@ async function ensureListSortOrdersOnce() {
 async function buildHomeDataPayload() {
   const [movies, listsFromDb, banners] = await Promise.all([
     Movie.find().select(
-      "key tmdbId type title overview tags posterUrl sourceKind"
+      "key tmdbId type title overview tags posterUrl sourceKind excludeFromLists"
     ).lean(),
     List.find().select("name movieKeys sortOrder").lean(),
     Banner.find().lean(),
@@ -1679,28 +1696,174 @@ app.post("/api/movie", async (req, res) => {
   }
 });
 
-async function deleteMovieByKey(key, res) {
+function escapeRegex(str) {
+  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function tmdbIdMatchFilter(tmdbId) {
+  const s = String(tmdbId || "").trim();
+  if (!s) return null;
+  const or = [{ tmdbId: s }];
+  const n = Number(s);
+  if (Number.isFinite(n)) or.push({ tmdbId: n });
+  return or.length === 1 ? or[0] : { $or: or };
+}
+
+async function findMoviesByListName(listName) {
+  const trimmed = String(listName || "").trim();
+  if (!trimmed || mongoose.connection.readyState !== 1) return [];
+  const lower = trimmed.toLowerCase();
+  const all = await Movie.find({
+    memberOfLists: { $exists: true, $ne: [] },
+  }).lean();
+  return all.filter((m) =>
+    (m.memberOfLists || []).some(
+      (n) => String(n || "").trim().toLowerCase() === lower
+    )
+  );
+}
+
+async function findMovieByRef(ref) {
+  if (!ref || mongoose.connection.readyState !== 1) return null;
+
+  const key = normalizeListMovieKey(ref.key || ref);
+  if (key) {
+    const exact = await Movie.findOne({ key }).lean();
+    if (exact) return exact;
+    const ci = await Movie.findOne({
+      key: { $regex: new RegExp(`^${escapeRegex(key)}$`, "i") },
+    }).lean();
+    if (ci) return ci;
+  }
+
+  const tmdbId = String(ref.tmdbId || "").trim();
+  const type = String(ref.type || "").trim();
+  if (tmdbId && type) {
+    const tmdbFilter = tmdbIdMatchFilter(tmdbId);
+    const byBoth = await Movie.findOne({ ...tmdbFilter, type }).lean();
+    if (byBoth) return byBoth;
+  }
+  if (tmdbId) {
+    const tmdbFilter = tmdbIdMatchFilter(tmdbId);
+    if (tmdbFilter) {
+      const list = await Movie.find(tmdbFilter).lean();
+      if (list.length === 1) return list[0];
+      if (type && list.length > 1) {
+        const match = list.find((m) => m.type === type);
+        if (match) return match;
+      }
+    }
+  }
+
+  const title = String(ref.title || "").trim();
+  if (title) {
+    const exactTitle = await Movie.findOne({
+      title: { $regex: new RegExp(`^${escapeRegex(title)}$`, "i") },
+    }).lean();
+    if (exactTitle) return exactTitle;
+    const loose = await Movie.findOne({
+      title: { $regex: new RegExp(escapeRegex(title), "i") },
+    }).lean();
+    if (loose) return loose;
+  }
+
+  return null;
+}
+
+/** All DB rows matching ref (duplicates, missing key, title variants). */
+async function findAllMoviesByRef(ref) {
+  const docs = [];
+  const seen = new Set();
+  const add = (doc) => {
+    if (!doc?._id) return;
+    const id = String(doc._id);
+    if (seen.has(id)) return;
+    seen.add(id);
+    docs.push(doc);
+  };
+
+  const primary = await findMovieByRef(ref);
+  add(primary);
+
+  const title = String(ref?.title || "").trim();
+  if (title) {
+    const byTitle = await Movie.find({
+      title: { $regex: new RegExp(escapeRegex(title), "i") },
+    }).lean();
+    byTitle.forEach(add);
+  }
+
+  const key = normalizeListMovieKey(ref?.key || ref);
+  if (key) {
+    const byKey = await Movie.find({
+      key: { $regex: new RegExp(`^${escapeRegex(key)}$`, "i") },
+    }).lean();
+    byKey.forEach(add);
+  }
+
+  const tmdbFilter = tmdbIdMatchFilter(ref?.tmdbId);
+  if (tmdbFilter) {
+    const byTmdb = await Movie.find(tmdbFilter).lean();
+    byTmdb.forEach(add);
+  }
+
+  return docs;
+}
+
+async function hardDeleteMovieDocs(docs) {
+  const pullKeys = new Set();
+  let deletedCount = 0;
+
+  for (const doc of docs) {
+    const result = await Movie.deleteOne({ _id: doc._id });
+    if (result.deletedCount) deletedCount += 1;
+    if (doc.key) pullKeys.add(String(doc.key).trim());
+  }
+
+  const keys = [...pullKeys].filter(Boolean);
+  if (keys.length) {
+    await List.updateMany({}, { $pull: { movieKeys: { $in: keys } } });
+    await Banner.updateMany(
+      { movieKey: { $in: keys } },
+      { $unset: { movieKey: "" } }
+    );
+  }
+
+  return { deletedCount, deletedKeys: keys };
+}
+
+async function deleteMovieByRef(ref, res) {
   if (mongoose.connection.readyState !== 1) {
     res.status(503).json({
       error: "Database not connected. Restart the server and check your MongoDB URI.",
     });
     return;
   }
-  const trimmed = String(key || "").trim();
-  if (!trimmed) {
-    res.status(400).json({ error: "Movie key is required." });
-    return;
-  }
   try {
-    const result = await Movie.deleteOne({ key: trimmed });
-    if (!result.deletedCount) {
-      res.status(404).json({ error: `Movie "${trimmed}" was not found.` });
+    const docs = await findAllMoviesByRef(ref);
+    if (!docs.length) {
+      const label =
+        normalizeListMovieKey(ref?.key) ||
+        ref?.title ||
+        ref?.tmdbId ||
+        "unknown";
+      res.status(404).json({ error: `Movie "${label}" was not found.` });
       return;
     }
-    await List.updateMany({}, { $pull: { movieKeys: trimmed } });
-    await Banner.updateMany({ movieKey: trimmed }, { $unset: { movieKey: "" } });
+    const { deletedCount, deletedKeys } = await hardDeleteMovieDocs(docs);
+    if (!deletedCount) {
+      res.status(500).json({ error: "Could not remove title from the database." });
+      return;
+    }
     invalidateHomeDataCache();
-    res.json({ ok: true, key: trimmed, revision: homeDataRevision });
+    res.json({
+      ok: true,
+      key: docs[0].key || deletedKeys[0] || String(docs[0]._id),
+      deletedId: String(docs[0]._id),
+      deletedCount,
+      deletedKeys,
+      revision: homeDataRevision,
+    });
   } catch (e) {
     res.status(500).json({
       error: "Failed to delete movie",
@@ -1712,11 +1875,82 @@ async function deleteMovieByKey(key, res) {
 // Delete movie
 app.delete("/api/movie/:key", async (req, res) => {
   const key = decodeURIComponent(req.params.key || "");
-  await deleteMovieByKey(key, res);
+  await deleteMovieByRef({ key }, res);
 });
 
 app.post("/api/movie/delete", async (req, res) => {
-  await deleteMovieByKey(req.body?.key, res);
+  await deleteMovieByRef(req.body || {}, res);
+});
+
+// Admin: force-delete by title/key (orphans after list was removed)
+app.post("/api/movie/purge", async (req, res) => {
+  if (!isAdminPanelRequest(req)) {
+    res.status(403).json({ error: "Admin access only." });
+    return;
+  }
+  const ref = req.body || {};
+  const title = String(ref.title || "").trim();
+  const key = normalizeListMovieKey(ref.key);
+  if (!title && !key && !ref.tmdbId) {
+    res.status(400).json({ error: "title, key, or tmdbId is required." });
+    return;
+  }
+  if (title && !ref.title) ref.title = title;
+  if (key && !ref.key) ref.key = key;
+
+  await deleteMovieByRef(ref, res);
+});
+
+// Admin: titles added with "Search & Random only" (not in custom lists)
+app.get("/api/admin/search-only-titles", async (req, res) => {
+  if (!isAdminPanelRequest(req)) {
+    res.status(403).json({ error: "Admin access only." });
+    return;
+  }
+  if (mongoose.connection.readyState !== 1) {
+    res.json({ titles: [] });
+    return;
+  }
+  try {
+    const [byFlag, listsFromDb, allMovies] = await Promise.all([
+      Movie.find({ excludeFromLists: true })
+        .select("key tmdbId type title posterUrl createdAt excludeFromLists")
+        .lean(),
+      List.find().select("movieKeys").lean(),
+      Movie.find()
+        .select("key tmdbId type title posterUrl createdAt excludeFromLists memberOfLists")
+        .lean(),
+    ]);
+    const keysInLists = new Set();
+    listsFromDb.forEach((l) => {
+      (l.movieKeys || []).forEach((raw) => {
+        const k = normalizeListMovieKey(raw);
+        if (k) keysInLists.add(k);
+      });
+    });
+    const orphans = allMovies.filter((m) => {
+      const k = normalizeListMovieKey(m.key);
+      if (!k || keysInLists.has(k)) return false;
+      if (m.excludeFromLists === true) return true;
+      const member = Array.isArray(m.memberOfLists) ? m.memberOfLists : [];
+      return member.length === 0;
+    });
+    const seen = new Set();
+    const merged = [];
+    [...byFlag, ...orphans].forEach((m) => {
+      const id = String(m._id || m.key || "");
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      merged.push(m);
+    });
+    merged.sort((a, b) => (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0));
+    res.json({ titles: merged });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to load search-only titles",
+      message: e?.message ?? String(e),
+    });
+  }
 });
 
 function isReservedRandomListName(name) {
@@ -1726,7 +1960,106 @@ function isReservedRandomListName(name) {
   return false;
 }
 
-async function deleteListByName(name, res) {
+function normalizeListMovieKey(entry) {
+  if (entry == null) return "";
+  if (typeof entry === "string") return entry.trim();
+  if (typeof entry === "object") {
+    return String(entry.key || entry.movieKey || entry.id || "").trim();
+  }
+  return String(entry).trim();
+}
+
+function collectMovieKeysFromListDocs(listDocs) {
+  const keys = new Set();
+  (listDocs || []).forEach((listDoc) => {
+    (listDoc.movieKeys || []).forEach((entry) => {
+      const k = normalizeListMovieKey(entry);
+      if (k) keys.add(k);
+    });
+  });
+  return keys;
+}
+
+/** Link movies ↔ lists in DB (fixes titles that were in a list UI but not in movieKeys). */
+async function repairListMembershipFromListDocs() {
+  if (mongoose.connection.readyState !== 1) return;
+  const lists = await List.find().lean();
+  let updated = 0;
+  for (const listDoc of lists) {
+    const listName = String(listDoc.name || "").trim();
+    if (!listName) continue;
+    for (const raw of listDoc.movieKeys || []) {
+      const key = normalizeListMovieKey(raw);
+      if (!key) continue;
+      const result = await Movie.updateOne(
+        { key },
+        { $addToSet: { memberOfLists: listName } }
+      );
+      if (result.modifiedCount || result.matchedCount) updated += 1;
+    }
+  }
+  if (updated) {
+    console.log(`🔗 Repaired list membership for ${updated} movie/list link(s)`);
+  }
+}
+
+function buildMovieRefsForListDelete(listDocs, options = {}, membershipMovies = []) {
+  const refs = [];
+  const seen = new Set();
+
+  const addRef = (ref) => {
+    if (!ref) return;
+    const key = normalizeListMovieKey(ref.key || ref);
+    const tmdbId = String(ref.tmdbId || "").trim();
+    const type = String(ref.type || "").trim();
+    const title = String(ref.title || "").trim().toLowerCase();
+    const sig = [key, tmdbId, type, title].join("::");
+    if (!key && !tmdbId && !title) return;
+    if (seen.has(sig)) return;
+    seen.add(sig);
+    refs.push({
+      key: key || undefined,
+      tmdbId: tmdbId || undefined,
+      type: type || undefined,
+      title: ref.title ? String(ref.title).trim() : undefined,
+    });
+  };
+
+  collectMovieKeysFromListDocs(listDocs).forEach((k) => addRef({ key: k }));
+  (Array.isArray(options.movieKeys) ? options.movieKeys : []).forEach((k) =>
+    addRef({ key: k })
+  );
+  (Array.isArray(options.movies) ? options.movies : []).forEach((m) =>
+    addRef(m)
+  );
+  (membershipMovies || []).forEach((m) =>
+    addRef({
+      key: m.key,
+      tmdbId: m.tmdbId,
+      type: m.type,
+      title: m.title,
+    })
+  );
+  return refs;
+}
+
+async function deleteMoviesByRefs(refs) {
+  const allDocs = [];
+  const seenIds = new Set();
+  for (const ref of refs || []) {
+    const docs = await findAllMoviesByRef(ref);
+    for (const doc of docs) {
+      const id = String(doc._id);
+      if (seenIds.has(id)) continue;
+      seenIds.add(id);
+      allDocs.push(doc);
+    }
+  }
+  const { deletedCount, deletedKeys } = await hardDeleteMovieDocs(allDocs);
+  return { deletedKeys, deletedCount };
+}
+
+async function deleteListByName(name, res, options = {}) {
   const trimmed = String(name || "").trim();
   if (!trimmed) {
     res.status(400).json({ error: "List name is required." });
@@ -1742,19 +2075,39 @@ async function deleteListByName(name, res) {
     const matches = all.filter(
       (l) => String(l.name || "").trim().toLowerCase() === lower
     );
+    const membershipMovies = await findMoviesByListName(trimmed);
+    const movieRefs = buildMovieRefsForListDelete(
+      matches,
+      options,
+      membershipMovies
+    );
+    const { deletedKeys, deletedCount } = await deleteMoviesByRefs(movieRefs);
+
     if (!matches.length) {
-      res.json({ ok: true, alreadyDeleted: true, name: trimmed });
+      invalidateHomeDataCache();
+      res.json({
+        ok: true,
+        alreadyDeleted: true,
+        name: trimmed,
+        deletedMovieKeys: deletedKeys,
+        deletedMovieCount: deletedCount,
+        revision: homeDataRevision,
+      });
       return;
     }
-    const result = await List.deleteMany({
+
+    await List.deleteMany({
       _id: { $in: matches.map((m) => m._id) },
     });
-    if (!result.deletedCount) {
-      res.json({ ok: true, alreadyDeleted: true, name: trimmed });
-      return;
-    }
+
     invalidateHomeDataCache();
-    res.json({ ok: true, name: trimmed, revision: homeDataRevision });
+    res.json({
+      ok: true,
+      name: trimmed,
+      deletedMovieKeys: deletedKeys,
+      deletedMovieCount: deletedCount,
+      revision: homeDataRevision,
+    });
   } catch (e) {
     res.status(500).json({
       error: "Failed to delete list",
@@ -1770,7 +2123,8 @@ app.post("/api/list/delete", async (req, res) => {
     });
     return;
   }
-  await deleteListByName(req.body?.name, res);
+  const { name, movieKeys, movies } = req.body || {};
+  await deleteListByName(name, res, { movieKeys, movies });
 });
 
 app.delete("/api/list/:name", async (req, res) => {
@@ -1780,7 +2134,16 @@ app.delete("/api/list/:name", async (req, res) => {
     });
     return;
   }
-  await deleteListByName(decodeURIComponent(req.params.name || ""), res);
+  const extra =
+    req.query?.movieKeys != null
+      ? String(req.query.movieKeys)
+          .split(",")
+          .map((k) => k.trim())
+          .filter(Boolean)
+      : [];
+  await deleteListByName(decodeURIComponent(req.params.name || ""), res, {
+    movieKeys: extra,
+  });
 });
 
 // Create list (if not exists) — also delete when body.action === "delete"
@@ -1791,9 +2154,9 @@ app.post("/api/list", async (req, res) => {
     });
     return;
   }
-  const { name, action } = req.body || {};
+  const { name, action, movieKeys, movies } = req.body || {};
   if (action === "delete" || action === "remove") {
-    await deleteListByName(name, res);
+    await deleteListByName(name, res, { movieKeys, movies });
     return;
   }
   const listName = String(name || "").trim();
@@ -1849,11 +2212,20 @@ app.post("/api/list/assign", async (req, res) => {
     return;
   }
   try {
+    const movie = await Movie.findOne({ key }).select("excludeFromLists").lean();
+    if (movie?.excludeFromLists === true) {
+      res.status(400).json({
+        error:
+          "This title is marked “Search & Random only” and cannot be added to a list.",
+      });
+      return;
+    }
     const list = await List.findOneAndUpdate(
       { name },
       { $addToSet: { movieKeys: key } },
       { upsert: true, returnDocument: "after" }
     );
+    await Movie.updateOne({ key }, { $addToSet: { memberOfLists: name } });
     invalidateHomeDataCache();
     res.json(list);
   } catch (e) {
