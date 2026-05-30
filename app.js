@@ -433,27 +433,36 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
 
   // NOTE: sliding should only happen via buttons (no wheel/touch scroll).
 
+  const updateEdges = () => {
+    const max = Math.max(0, wrapper.scrollWidth - wrapper.clientWidth);
+    const left = Math.max(0, wrapper.scrollLeft || 0);
+    const atStart = left <= 2;
+    const atEnd = left >= max - 2;
+    container.classList.toggle("movie-list-container--at-start", atStart);
+    container.classList.toggle("movie-list-container--at-end", atEnd);
+    leftBtn.disabled = atStart;
+    rightBtn.disabled = atEnd;
+  };
+
   leftBtn.addEventListener("click", () => {
     wrapper.scrollBy({ left: -850, behavior: "smooth" });
+    window.setTimeout(updateEdges, 260);
   });
   rightBtn.addEventListener("click", () => {
     wrapper.scrollBy({ left: 850, behavior: "smooth" });
+    window.setTimeout(updateEdges, 260);
   });
 
-  let rowHoverTimer = null;
   const showRowNav = () => container.classList.add("movie-list-container--nav-visible");
   const hideRowNav = () => container.classList.remove("movie-list-container--nav-visible");
 
   container.addEventListener("mouseenter", () => {
-    rowHoverTimer = window.setTimeout(showRowNav, 1200);
+    showRowNav();
   });
   container.addEventListener("mouseleave", () => {
-    if (rowHoverTimer) clearTimeout(rowHoverTimer);
-    rowHoverTimer = null;
     hideRowNav();
   });
   container.addEventListener("focusin", () => {
-    if (rowHoverTimer) clearTimeout(rowHoverTimer);
     showRowNav();
   });
   container.addEventListener("focusout", (e) => {
@@ -465,6 +474,13 @@ function appendMovieListSection(root, data, listTitle, movieKeys) {
   container.appendChild(leftBtn);
   container.appendChild(rightBtn);
   root.appendChild(container);
+
+  // Initial edge state + keep it accurate on resize/scroll.
+  updateEdges();
+  wrapper.addEventListener("scroll", () => {
+    if (container.classList.contains("movie-list-container--nav-visible")) updateEdges();
+  });
+  window.addEventListener("resize", updateEdges);
 }
 
 // RENDER LISTS ON HOME PAGE (DYNAMIC)
@@ -526,24 +542,31 @@ async function renderDynamicLists(dataIn) {
 
   const listNames = getOrderedCustomListNames(data);
 
-  listNames.forEach((listName) => {
+  const yieldToMain = () =>
+    new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+  for (const listName of listNames) {
     let movieIds = (data.lists[listName] || []).filter((k) => {
       const movie = movies[k];
       return movie && !isExcludedFromCustomLists(movie);
     });
     movieIds = shuffleArray(movieIds);
-    if (!movieIds.length) return;
+    if (!movieIds.length) continue;
     appendMovieListSection(root, data, listName, movieIds);
-  });
+    // Prevent long blocking renders for huge libraries.
+    await yieldToMain();
+  }
 
   // Random rows at bottom: every title; 10 per row; shuffled each load.
   if (allKeys.length) {
     const shuffledAll = shuffleArray(allKeys);
     const parts = chunkArray(shuffledAll, RANDOM_ROW_SIZE);
-    parts.forEach((chunkKeys, i) => {
+    for (let i = 0; i < parts.length; i++) {
+      const chunkKeys = parts[i];
       const title = i === 0 ? "Random" : `Random ${i + 1}`;
       appendMovieListSection(root, data, title, chunkKeys);
-    });
+      await yieldToMain();
+    }
   }
 }
 

@@ -5,8 +5,12 @@ const STORAGE_KEY = "flakes_movies_data";
 // whatever tag you give. If the server returns empty VAST (no <Ad>), you get no ad on ANY tag.
 // Optional test override: player.html?key=...&adtag=ENCODED_FULL_TAG_URL
 const VAST_TAG_URL_BASE =
-  "https://exalted-engineering.com/dEmbF_z.dxGINSvhZHG/Ux/IeKmL9HuIZOU/lHkUPwTLYa5oNxzFY/wDNZDhU/tFN_j/kR3bNGjtAT0YOXQ-";
+ "";
 
+
+ //https://exalted-engineering.com/dEmbF_z.dxGINSvhZHG/Ux/IeKmL9HuIZOU/lHkUPwTLYa5oNxzFY/wDNZDhU/tFN_j/kR3bNGjtAT0YOXQ-
+
+ 
 const API_BASE =
   typeof window.ZYRO_API_BASE === "string"
     ? window.ZYRO_API_BASE

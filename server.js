@@ -2198,6 +2198,77 @@ app.post("/api/lists/reorder", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/api/list/rename", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const oldName = String(req.body?.oldName || "").trim();
+  const newName = String(req.body?.newName || "").trim();
+  if (!oldName || !newName) {
+    res.status(400).json({ error: "oldName and newName are required." });
+    return;
+  }
+  if (isReservedRandomListName(oldName) || isReservedRandomListName(newName)) {
+    res.status(400).json({ error: "Random lists cannot be renamed." });
+    return;
+  }
+  const oldLower = oldName.toLowerCase();
+  const newLower = newName.toLowerCase();
+  if (oldLower === newLower) {
+    res.json({ ok: true, oldName, newName });
+    return;
+  }
+  try {
+    const allLists = await List.find().lean();
+    const target = allLists.find(
+      (l) => String(l.name || "").trim().toLowerCase() === oldLower
+    );
+    if (!target) {
+      res.status(404).json({ error: `List "${oldName}" not found.` });
+      return;
+    }
+    const existsNew = allLists.find(
+      (l) => String(l.name || "").trim().toLowerCase() === newLower
+    );
+    if (existsNew) {
+      res.status(400).json({ error: `List "${newName}" already exists.` });
+      return;
+    }
+
+    await List.updateOne({ _id: target._id }, { $set: { name: newName } });
+
+    const movies = await Movie.find({
+      memberOfLists: { $exists: true, $ne: [] },
+    }).lean();
+    for (const m of movies) {
+      const current = Array.isArray(m.memberOfLists) ? m.memberOfLists : [];
+      let changed = false;
+      const next = current.map((n) => {
+        if (String(n || "").trim().toLowerCase() === oldLower) {
+          changed = true;
+          return newName;
+        }
+        return n;
+      });
+      if (changed) {
+        const dedup = [...new Set(next.map((n) => String(n || "").trim()).filter(Boolean))];
+        await Movie.updateOne({ _id: m._id }, { $set: { memberOfLists: dedup } });
+      }
+    }
+
+    invalidateHomeDataCache();
+    res.json({ ok: true, oldName, newName, revision: homeDataRevision });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to rename list",
+      message: e?.message ?? String(e),
+    });
+  }
+});
+
 // Assign movie to list
 app.post("/api/list/assign", async (req, res) => {
   if (mongoose.connection.readyState !== 1) {
@@ -2231,6 +2302,92 @@ app.post("/api/list/assign", async (req, res) => {
   } catch (e) {
     res.status(500).json({
       error: "Failed to assign movie to list",
+      message: e?.message ?? String(e),
+    });
+  }
+});
+
+app.post("/api/movie/placement", async (req, res) => {
+  if (mongoose.connection.readyState !== 1) {
+    res.status(503).json({
+      error: "Database not connected. Restart the server and check your MongoDB URI.",
+    });
+    return;
+  }
+  const key = String(req.body?.key || "").trim();
+  const rawTargetList = String(req.body?.targetList || "").trim();
+  const searchOnly = req.body?.searchOnly === true;
+  if (!key) {
+    res.status(400).json({ error: "Movie key is required." });
+    return;
+  }
+  if (!searchOnly && !rawTargetList) {
+    res.status(400).json({ error: "targetList is required when searchOnly is false." });
+    return;
+  }
+  if (rawTargetList && isReservedRandomListName(rawTargetList)) {
+    res.status(400).json({ error: "Cannot assign titles to Random lists." });
+    return;
+  }
+
+  try {
+    const movie = await Movie.findOne({ key });
+    if (!movie) {
+      res.status(404).json({ error: `Movie "${key}" not found.` });
+      return;
+    }
+
+    // Remove from every list first (transfer behavior).
+    await List.updateMany({}, { $pull: { movieKeys: key } });
+
+    if (searchOnly) {
+      movie.excludeFromLists = true;
+      movie.memberOfLists = [];
+      await movie.save();
+      invalidateHomeDataCache();
+      res.json({
+        ok: true,
+        key,
+        searchOnly: true,
+        targetList: null,
+        revision: homeDataRevision,
+      });
+      return;
+    }
+
+    const allLists = await List.find().lean();
+    let targetName = rawTargetList;
+    const existing = allLists.find(
+      (l) => String(l.name || "").trim().toLowerCase() === rawTargetList.toLowerCase()
+    );
+    if (existing) {
+      targetName = String(existing.name || "").trim();
+      await List.updateOne({ _id: existing._id }, { $addToSet: { movieKeys: key } });
+    } else {
+      const maxAgg = await List.aggregate([{ $group: { _id: null, m: { $max: "$sortOrder" } } }]);
+      const nextOrder = (maxAgg[0]?.m ?? 0) + 1;
+      await List.create({
+        name: targetName,
+        movieKeys: [key],
+        sortOrder: nextOrder,
+      });
+    }
+
+    movie.excludeFromLists = false;
+    movie.memberOfLists = [targetName];
+    await movie.save();
+
+    invalidateHomeDataCache();
+    res.json({
+      ok: true,
+      key,
+      searchOnly: false,
+      targetList: targetName,
+      revision: homeDataRevision,
+    });
+  } catch (e) {
+    res.status(500).json({
+      error: "Failed to update movie placement",
       message: e?.message ?? String(e),
     });
   }

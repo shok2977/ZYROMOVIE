@@ -382,6 +382,36 @@ async function upsertList(name) {
   return data;
 }
 
+async function renameList(oldName, newName) {
+  const res = await adminFetch("/api/list/rename", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ oldName, newName }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `List rename failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
+async function updateMoviePlacement(key, targetList, searchOnly) {
+  const res = await adminFetch("/api/movie/placement", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      key,
+      targetList: String(targetList || "").trim(),
+      searchOnly: searchOnly === true,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `Movie placement update failed (HTTP ${res.status})`);
+  }
+  return data;
+}
+
 async function requestListDeleteApi(trimmed, entries) {
   const movieKeys = (entries || []).map((e) => e.key).filter(Boolean);
   const payload = { name: trimmed, movieKeys, movies: entries || [] };
@@ -866,55 +896,140 @@ function renderDashboard() {
     return;
   }
 
-  const table = document.createElement("div");
-  table.className = "admin-table-inner";
-  const header = document.createElement("div");
-  header.className = "admin-table-row admin-table-header";
-  header.innerHTML = `
-    <div>Title</div>
-    <div>Type</div>
-    <div>TMDB ID</div>
-    <div>Lists</div>
-    <div></div>
-  `;
-  table.appendChild(header);
-
   const sortedKeys = movieKeys.slice().sort((a, b) => {
     const ta = Number(data.movies[a]?.createdAt) || 0;
     const tb = Number(data.movies[b]?.createdAt) || 0;
     return tb - ta;
   });
 
-  sortedKeys.forEach((key) => {
-    const m = data.movies[key];
-    const searchOnly = m.excludeFromLists === true;
-    const listLabel = searchOnly
-      ? '<span style="color:#ff9f43;">Search &amp; Random only</span>'
-      : (() => {
-          const names = [];
-          Object.keys(data.lists || {}).forEach((listName) => {
-            if ((data.lists[listName] || []).includes(key)) names.push(listName);
-          });
-          return names.length ? names.join(", ") : "—";
-        })();
-    const row = document.createElement("div");
-    row.className = "admin-table-row";
-    row.innerHTML = `
-      <div>${m.title || "Untitled"}</div>
-      <div>${m.type || "-"}</div>
-      <div>${m.tmdbId || "-"}</div>
-      <div style="font-size:12px;">${listLabel}</div>
-      <div>
-        <button class="admin-secondary-btn admin-edit-btn" data-key="${key}">Edit</button>
-        <button class="admin-delete-btn" data-key="${key}"
-          data-title="${String(m.title || "").replace(/"/g, "&quot;")}"
-          data-tmdb-id="${String(m.tmdbId || "")}"
-          data-type="${String(m.type || "")}">Delete</button>
-      </div>
-    `;
-    table.appendChild(row);
+  // Slider-like pagination for lots of titles.
+  const PER_PAGE = 10;
+  const totalPages = Math.max(1, Math.ceil(sortedKeys.length / PER_PAGE));
+  let pageIndex = 0;
+
+  const sliderWrap = document.createElement("div");
+  sliderWrap.className = "admin-recent-slider";
+
+  const tableHost = document.createElement("div");
+  tableHost.className = "admin-recent-slider-table";
+  sliderWrap.appendChild(tableHost);
+
+  const controls = document.createElement("div");
+  controls.className = "admin-recent-slider-controls";
+
+  const meta = document.createElement("div");
+  meta.className = "admin-recent-slider-meta";
+  controls.appendChild(meta);
+
+  const btnGroup = document.createElement("div");
+  btnGroup.className = "admin-recent-slider-btn-group";
+
+  const prevBtn = document.createElement("button");
+  prevBtn.type = "button";
+  prevBtn.className = "admin-secondary-btn admin-recent-slider-btn";
+  prevBtn.textContent = "← Prev";
+  prevBtn.addEventListener("click", () => {
+    pageIndex = Math.max(0, pageIndex - 1);
+    renderPage();
   });
-  recentListEl.appendChild(table);
+
+  const nextBtn = document.createElement("button");
+  nextBtn.type = "button";
+  nextBtn.className = "admin-secondary-btn admin-recent-slider-btn";
+  nextBtn.textContent = "Next →";
+  nextBtn.addEventListener("click", () => {
+    pageIndex = Math.min(totalPages - 1, pageIndex + 1);
+    renderPage();
+  });
+
+  btnGroup.appendChild(prevBtn);
+  btnGroup.appendChild(nextBtn);
+  controls.appendChild(btnGroup);
+  sliderWrap.appendChild(controls);
+
+  const renderHeader = () => {
+    const header = document.createElement("div");
+    header.className = "admin-table-row admin-table-header";
+    header.innerHTML = `
+      <div>Title</div>
+      <div>Type</div>
+      <div>TMDB ID</div>
+      <div>Lists</div>
+      <div></div>
+    `;
+    return header;
+  };
+
+  const renderPage = () => {
+    const start = pageIndex * PER_PAGE;
+    const endExclusive = Math.min(sortedKeys.length, start + PER_PAGE);
+    const pageKeys = sortedKeys.slice(start, endExclusive);
+
+    tableHost.innerHTML = "";
+
+    const table = document.createElement("div");
+    table.className = "admin-table-inner";
+    table.appendChild(renderHeader());
+
+    pageKeys.forEach((key) => {
+      const m = data.movies[key];
+      const searchOnly = m.excludeFromLists === true;
+      const listLabel = searchOnly
+        ? '<span style="color:#ff9f43;">Search &amp; Random only</span>'
+        : (() => {
+            const names = [];
+            Object.keys(data.lists || {}).forEach((listName) => {
+              if ((data.lists[listName] || []).includes(key))
+                names.push(listName);
+            });
+            return names.length ? names.join(", ") : "—";
+          })();
+
+      const row = document.createElement("div");
+      row.className = "admin-table-row";
+      row.innerHTML = `
+        <div>${m.title || "Untitled"}</div>
+        <div>${m.type || "-"}</div>
+        <div>${m.tmdbId || "-"}</div>
+        <div style="font-size:12px;">${listLabel}</div>
+        <div>
+          <button class="admin-secondary-btn admin-edit-btn" data-key="${key}">Edit</button>
+          <button class="admin-delete-btn" data-key="${key}"
+            data-title="${String(m.title || "").replace(/"/g, "&quot;")}"
+            data-tmdb-id="${String(m.tmdbId || "")}"
+            data-type="${String(m.type || "")}">Delete</button>
+        </div>
+      `;
+      table.appendChild(row);
+    });
+
+    tableHost.appendChild(table);
+
+    meta.textContent =
+      sortedKeys.length > 0
+        ? `Page ${pageIndex + 1} / ${totalPages} • Showing ${start + 1}-${endExclusive} of ${sortedKeys.length}`
+        : "";
+
+    prevBtn.disabled = pageIndex <= 0;
+    nextBtn.disabled = pageIndex >= totalPages - 1;
+  };
+
+  // Hide controls if not needed.
+  controls.style.display = totalPages > 1 ? "" : "none";
+  recentListEl.appendChild(sliderWrap);
+  renderPage();
+}
+
+function getMoviePrimaryListName(data, movieKey, movieObj) {
+  if (!movieKey) return "";
+  const listsObj = data?.lists || {};
+  const fromLists = Object.keys(listsObj).find((listName) =>
+    (listsObj[listName] || []).includes(movieKey)
+  );
+  if (fromLists) return fromLists;
+  const member = Array.isArray(movieObj?.memberOfLists) ? movieObj.memberOfLists : [];
+  const first = member.find((n) => String(n || "").trim());
+  return first ? String(first).trim() : "";
 }
 
 let currentEditMovieKey = null;
@@ -990,6 +1105,35 @@ function openEditMovie(key) {
   if (titleEl) {
     titleEl.textContent = movie.title || "Untitled";
   }
+
+  ensureEditPlacementControls();
+  const editListSelect = document.getElementById("edit-movie-list-select");
+  const editSearchOnly = document.getElementById("edit-movie-search-only");
+  const ordered = getOrderedCustomListNames(data);
+  if (editListSelect) {
+    editListSelect.innerHTML = "";
+    if (!ordered.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "Create a list in Lists tab first";
+      editListSelect.appendChild(opt);
+    } else {
+      ordered.forEach((name) => {
+        const opt = document.createElement("option");
+        opt.value = name;
+        opt.textContent = name;
+        editListSelect.appendChild(opt);
+      });
+    }
+  }
+  const currentList = getMoviePrimaryListName(data, key, movie);
+  if (editSearchOnly) editSearchOnly.checked = movie.excludeFromLists === true;
+  if (editListSelect && currentList) {
+    const found = ordered.find((n) => listNameMatches(n, currentList));
+    if (found) editListSelect.value = found;
+  }
+  if (editListSelect) editListSelect.disabled = editSearchOnly?.checked === true;
+
   // Open edit section immediately so UI never looks "dead" even if deeper render fails.
   switchSection("dashboard-section"); // ensure valid sections exist
   switchSection("edit-movie-section");
@@ -1121,6 +1265,37 @@ function renderLists() {
     countCell.textContent = String(count);
 
     const actionCell = document.createElement("div");
+    actionCell.style.display = "flex";
+    actionCell.style.gap = "8px";
+    actionCell.style.flexWrap = "wrap";
+
+    const renameBtn = document.createElement("button");
+    renameBtn.type = "button";
+    renameBtn.className = "admin-secondary-btn";
+    renameBtn.textContent = "Rename";
+    renameBtn.addEventListener("click", async () => {
+      const next = prompt("Enter new list name:", name);
+      const newName = String(next || "").trim();
+      if (!newName || listNameMatches(newName, name)) return;
+      if (isReservedRandomListName(newName)) {
+        alert('This name is reserved for auto-generated Random rows.');
+        return;
+      }
+      renameBtn.disabled = true;
+      try {
+        await renameList(name, newName);
+        await refreshData();
+        await refreshAssignListSelect();
+        renderLists();
+        renderDashboard();
+      } catch (e) {
+        console.error(e);
+        alert(e?.message || "Could not rename list.");
+      } finally {
+        renameBtn.disabled = false;
+      }
+    });
+
     const delBtn = document.createElement("button");
     delBtn.type = "button";
     delBtn.className = "admin-delete-btn";
@@ -1160,6 +1335,7 @@ function renderLists() {
         delBtn.disabled = false;
       }
     });
+    actionCell.appendChild(renameBtn);
     actionCell.appendChild(delBtn);
 
     row.appendChild(posCell);
@@ -1692,6 +1868,39 @@ async function refreshAssignListSelect() {
 function populateAssignListSelect() {
   reconcileCachedLists();
   return renderAssignListOptions(getOrderedCustomListNames(loadMovieData()));
+}
+
+function ensureEditPlacementControls() {
+  let wrap = document.getElementById("edit-placement-controls");
+  if (wrap) return wrap;
+  const section = document.getElementById("edit-movie-section");
+  const title = document.getElementById("edit-movie-title");
+  if (!section || !title) return null;
+
+  wrap = document.createElement("div");
+  wrap.id = "edit-placement-controls";
+  wrap.className = "admin-form";
+  wrap.style.marginTop = "12px";
+  wrap.style.marginBottom = "8px";
+  wrap.innerHTML = `
+    <label class="admin-label" for="edit-movie-list-select">Transfer to list</label>
+    <select id="edit-movie-list-select" class="admin-input"></select>
+    <label class="admin-label" for="edit-movie-search-only" style="display:flex;align-items:flex-start;gap:10px;cursor:pointer;">
+      <input id="edit-movie-search-only" type="checkbox" style="margin-top:3px;width:auto;" />
+      <span>Search & Random only (remove from all custom lists)</span>
+    </label>
+    <p class="admin-small">When saving edit, this title will be moved from old list to selected list.</p>
+  `;
+  title.insertAdjacentElement("afterend", wrap);
+
+  const checkbox = document.getElementById("edit-movie-search-only");
+  const listSelect = document.getElementById("edit-movie-list-select");
+  if (checkbox && listSelect) {
+    checkbox.addEventListener("change", () => {
+      listSelect.disabled = checkbox.checked;
+    });
+  }
+  return wrap;
 }
 
 async function fetchTmdbTvSeasonsDirect(tmdbId, maxSeasons = 3) {
@@ -2814,13 +3023,28 @@ document.addEventListener("DOMContentLoaded", async () => {
       const data = loadMovieData();
       const movie = data.movies[currentEditMovieKey];
       if (!movie) return;
+      const editListSelect = document.getElementById("edit-movie-list-select");
+      const editSearchOnly = document.getElementById("edit-movie-search-only");
+      const selectedList = String(editListSelect?.value || "").trim();
+      const searchOnly = editSearchOnly?.checked === true;
+      if (!searchOnly && !selectedList) {
+        alert("Choose a target list, or enable Search & Random only.");
+        return;
+      }
       if (movie.sourceKind !== "download") {
-        await upsertMovie(movie);
-        await refreshData();
-        renderDashboard();
-        renderLists();
-        currentEditMovieKey = null;
-        switchSection("dashboard-section");
+        try {
+          await upsertMovie(movie);
+          await updateMoviePlacement(currentEditMovieKey, selectedList, searchOnly);
+          await refreshData();
+          await refreshAssignListSelect();
+          renderDashboard();
+          renderLists();
+          currentEditMovieKey = null;
+          switchSection("dashboard-section");
+        } catch (e) {
+          console.error(e);
+          alert(e?.message || "Could not save title changes.");
+        }
         return;
       }
 
@@ -2872,12 +3096,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         }
       }
 
-      await upsertMovie(movie);
-      await refreshData();
-      renderDashboard();
-      renderLists();
-      currentEditMovieKey = null;
-      switchSection("dashboard-section");
+      try {
+        await upsertMovie(movie);
+        await updateMoviePlacement(currentEditMovieKey, selectedList, searchOnly);
+        await refreshData();
+        await refreshAssignListSelect();
+        renderDashboard();
+        renderLists();
+        currentEditMovieKey = null;
+        switchSection("dashboard-section");
+      } catch (e) {
+        console.error(e);
+        alert(e?.message || "Could not save title changes.");
+      }
     });
   }
 
